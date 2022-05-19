@@ -1,6 +1,7 @@
 # TODO: Put your implementation of the encoder here
 import numpy as np
-from scipy.fftpack import dct 
+from scipy.fftpack import dct
+import quantization as quant
 
 
 def encoder(yuv_vid):
@@ -9,7 +10,9 @@ def encoder(yuv_vid):
     '''
     blockData = divide_in_blocks(yuv_vid, (32,64))
     dctBlocks = applyDCT(blockData)
-    return dctBlocks
+    quantizedBlocks = quantization(dctBlocks)
+    bitstream = zigzag(quantizedBlocks)
+    return quantizedBlocks
 
 
 def divide_in_blocks(vid, block_size=(64, 64)):
@@ -48,3 +51,51 @@ def applyDCT(blocks):
             blocks[component][block] = dct(dct(blocks[component][block].T, norm="ortho").T, norm="ortho")
 
     return blocks
+
+
+def quantization(blocks):
+    quantization_matrices = {}
+
+    for component in ["Y", "U", "V"]:
+        for key in blocks[component]:
+            blockSize = blocks[component][key].shape
+            if blockSize not in quantization_matrices:
+                quantization_matrices[blockSize] = quant.get_quantization_matrix(blockSize, quant.DefaultQuantizationFunction)
+            blocks[component][key] = np.round(blocks[component][key] / quantization_matrices[blockSize])
+
+    return blocks
+
+
+def zigzag(blocks):
+
+    totalSize = blocks["frames"] * (blocks["luma_frame_size"][0] * blocks["luma_frame_size"][1] + blocks["chroma_frame_size"][0] * blocks["chroma_frame_size"][1] * 2)
+    bitstream = np.empty(totalSize)
+    i = 0
+
+    for component in ["Y", "U", "V"]:
+        
+        for key in blocks[component]:
+
+            blockSize = blocks[component][key].shape
+
+            #Horizontal case
+            for x in range(blockSize[0] - 1):
+                curx = x
+                cury = 0
+                while curx >= 0 and cury < blockSize[1]:
+                    bitstream[i] = blocks[component][key][curx, cury]
+                    i += 1
+                    curx -= 1
+                    cury += 1
+
+            #Vertical case
+            for y in range(blockSize[1]):
+                cury = y
+                curx = blockSize[0] - 1
+                while curx >= 0 and cury < blockSize[1]:
+                    bitstream[i] = blocks[component][key][curx, cury]
+                    i += 1
+                    curx -= 1
+                    cury += 1
+
+    return bitstream

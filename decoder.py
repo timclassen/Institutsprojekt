@@ -1,36 +1,14 @@
 # TODO: Put your implementation of the encoder here
 import numpy as np
 from scipy.fftpack import idct
-'''
-    newDict = {}
-    blockSizes = {"Y":block_size, "U":(block_size[0] // (vid["Y"].shape[1] // vid["U"].shape[1]), block_size[1] // (vid["Y"].shape[2] // vid["U"].shape[2])), "V":(block_size[0] // (vid["Y"].shape[1] // vid["V"].shape[1]), block_size[1] // (vid["Y"].shape[2] // vid["V"].shape[2]))}
+import quantization as quant
 
-    print(blockSizes)
-
-    for component in vid:
-
-        print(component)
-
-        compBlockSize = blockSizes[component]
-
-        newDict[component] = {}
-        frameCount = vid[component].shape[0]
-        width = vid[component][0].shape[0]
-        height = vid[component][0].shape[1]
-        blocksInX = (width + compBlockSize[0] - 1) // compBlockSize[0]
-        blocksInY = (height + compBlockSize[1] - 1) // compBlockSize[1]
-
-        for frame in range(0, vid[compo
-(frame, x // compBlockSize[0], y // compBlockSize[1])] = vid[component][frame, x:x + compBlockSize[0], y:y + compBlockSize[1]]
-
-    print(width, height, blocksInX, blocksInY)
-  newDict["luma_frame_size"] = (vid["Y"].shape[1],vid["Y"].shape[2])
-    newDict["chroma_frame_size"] = (vid["U"].shape[1],vid["U"].shape[2])
-'''
 
 def decoder(bitstream):
 
-    idctBlocks = applyIDCT(bitstream)
+    dezigzagBlocks = dezigzag(bitstream)
+    quantizedBlocks = dequantization(dezigzagBlocks)
+    idctBlocks = applyIDCT(quantizedBlocks)
     result = reassembleFromBlocks(idctBlocks)
     return result
 
@@ -57,12 +35,32 @@ def reassembleFromBlocks(blockDict):
     return newDict
 
 
-
 def applyIDCT(blocks):
 
     for component in ["Y", "U", "V"]:
 
         for block in blocks[component]:
             blocks[component][block] = idct(idct(blocks[component][block].T, norm="ortho").T, norm="ortho")
+
+    return blocks
+
+
+def dequantization(blocks):
+    quantization_matrices = {}
+
+    for component in ["Y", "U", "V"]:
+        for key in blocks[component]:
+            blockSize = blocks[component][key].shape
+            if blockSize not in quantization_matrices:
+                quantization_matrices[blockSize] = quant.get_quantization_matrix(blockSize, quant.DefaultQuantizationFunction)
+            blocks[component][key] *= quantization_matrices[blockSize]
+ 
+    return blocks
+
+    
+
+def dezigzag(bistream):
+
+
 
     return blocks

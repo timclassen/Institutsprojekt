@@ -11,10 +11,11 @@ def encode_and_decode_video(yuv_video_path):
     original_video = read_yuv_video(yuv_video_path)
     bitstream = encoder(original_video)
     # bitstream_path = write_bitstream("tmp/encodedVid.yuv", bitstream)
-
+    print("Encoded")
     #bitstream_from_file = read_bitstream(bitstream_path)
     decoded_video = decoder(bitstream)
     # write_yuv_video(decoded_video, "tmp/decodedVid.yuv")
+    print("Decoded")
 
     # original_video_size = os.path.getsize(yuv_video_path)
     # bitstream_size = os.path.getsize(bitstream_path)
