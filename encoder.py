@@ -71,7 +71,7 @@ def quantization(blocks):
 def zigzag(blocks):
 
     totalSize = blocks["frames"] * (blocks["luma_frame_size"][0] * blocks["luma_frame_size"][1] + blocks["chroma_frame_size"][0] * blocks["chroma_frame_size"][1] * 2)
-    bitstream = np.empty(totalSize, dtype=np.uint32)
+    bitstream = np.empty(totalSize, dtype=np.int32)
     cursor = 0
 
     zigzagIndices = {}
@@ -83,6 +83,7 @@ def zigzag(blocks):
             blockSize = block.shape
             pixelCount = blockSize[0] * blockSize[1]
 
+            #If block transform indices haven't been calculated yet
             if blockSize not in zigzagIndices:
 
                 transformArray = np.empty(pixelCount, dtype='uint32, uint32')
@@ -93,7 +94,7 @@ def zigzag(blocks):
                     curx = x
                     cury = 0
                     while curx >= 0 and cury < blockSize[1]:
-                        transformArray[cury * blockSize[0] + curx] = (i % blockSize[0], i // blockSize[0])
+                        transformArray[i] = (curx, cury)
                         i += 1
                         curx -= 1
                         cury += 1
@@ -103,16 +104,21 @@ def zigzag(blocks):
                     cury = y
                     curx = blockSize[0] - 1
                     while curx >= 0 and cury < blockSize[1]:
-                        transformArray[cury * blockSize[0] + curx] = (i % blockSize[0], i // blockSize[0])
+                        transformArray[i] = (curx, cury)
                         i += 1
                         curx -= 1
                         cury += 1
 
+                #Add transform array to known zigzag sequences
                 zigzagIndices[blockSize] = transformArray
 
+            #Iterate over all pixels inside a single block
             for n in range(pixelCount):
 
+                #Obtain the zigzag index
                 index = zigzagIndices[blockSize][n]
+
+                #Write the pixel to the zigzag destination
                 bitstream[cursor + n] = block[index[0], index[1]]
 
             cursor += pixelCount
