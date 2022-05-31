@@ -1,8 +1,9 @@
 # TODO: Put your implementation of the encoder here
+from pickletools import uint8
 import numpy as np
 from scipy.fftpack import dct
 import quantization as quant
-
+import time
 
 
 def encoder(yuv_vid):
@@ -13,7 +14,7 @@ def encoder(yuv_vid):
     dctBlocks = applyDCT(blockData)
     quantizedBlocks = quantization(dctBlocks)
     bitstream = zigzag(quantizedBlocks)
-    return quantizedBlocks
+    return bitstream
 
 
 def divide_in_blocks(vid, block_size=(64, 64)):
@@ -70,21 +71,21 @@ def quantization(blocks):
 def zigzag(blocks):
 
     totalSize = blocks["frames"] * (blocks["luma_frame_size"][0] * blocks["luma_frame_size"][1] + blocks["chroma_frame_size"][0] * blocks["chroma_frame_size"][1] * 2)
-    bitstream = np.empty(totalSize)
+    bitstream = np.empty(totalSize, dtype=np.uint32)
     cursor = 0
 
     zigzagIndices = {}
 
     for component in ["Y", "U", "V"]:
         
-        for key in blocks[component]:
-
-            blockSize = blocks[component][key].shape
+        for key, block in blocks[component].items():
+            
+            blockSize = block.shape
             pixelCount = blockSize[0] * blockSize[1]
 
             if blockSize not in zigzagIndices:
 
-                transformArray = np.empty(pixelCount)
+                transformArray = np.empty(pixelCount, dtype='uint32, uint32')
                 i = 0
                 
                 #Horizontal case
@@ -92,7 +93,7 @@ def zigzag(blocks):
                     curx = x
                     cury = 0
                     while curx >= 0 and cury < blockSize[1]:
-                        transformArray[curx * blockSize[0] + curY] = i
+                        transformArray[cury * blockSize[0] + curx] = (i % blockSize[0], i // blockSize[0])
                         i += 1
                         curx -= 1
                         cury += 1
@@ -102,7 +103,7 @@ def zigzag(blocks):
                     cury = y
                     curx = blockSize[0] - 1
                     while curx >= 0 and cury < blockSize[1]:
-                        transformArray[curx * blockSize[0] + curY] = i
+                        transformArray[cury * blockSize[0] + curx] = (i % blockSize[0], i // blockSize[0])
                         i += 1
                         curx -= 1
                         cury += 1
@@ -111,8 +112,8 @@ def zigzag(blocks):
 
             for n in range(pixelCount):
 
-                index = blockSizezigzagIndices[blockSize][n];
-                bitstream[cursor + n] = blocks[component][key][index % blockSize[0], index // blockSize[0]]
+                index = zigzagIndices[blockSize][n]
+                bitstream[cursor + n] = block[index[0], index[1]]
 
             cursor += pixelCount
 
