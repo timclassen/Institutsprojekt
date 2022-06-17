@@ -2,18 +2,27 @@
 from yuv_io import read_yuv_video, write_yuv_video
 from encoder import encoder
 from decoder import decoder
+from header import Header
 from bitstream_io import write_bitstream, read_bitstream
 from psnr import psnr_yuv
 import os
 
 
 def encode_and_decode_video(yuv_video_path):
+
     original_video = read_yuv_video(yuv_video_path)
-    bitstream = encoder(original_video)
+
+    header = Header()
+    header.lumaSize = (original_video["Y"].shape[1], original_video["Y"].shape[2])
+    header.chromaSize = (original_video["U"].shape[1], original_video["U"].shape[2])
+    header.frameCount = original_video["Y"].shape[0]
+
+    bitstream = encoder(original_video, header)
+
     # bitstream_path = write_bitstream("tmp/encodedVid.yuv", bitstream)
     print("Encoded")
     #bitstream_from_file = read_bitstream(bitstream_path)
-    decoded_video = decoder(bitstream)
+    decoded_video = decoder(bitstream, header)
     # write_yuv_video(decoded_video, "tmp/decodedVid.yuv")
     print("Decoded")
 

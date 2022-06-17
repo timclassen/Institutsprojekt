@@ -4,23 +4,21 @@ from scipy.fftpack import idct
 import quantization as quant
 
 
-def decoder(bitstream):
+def decoder(bitstream, header):
 
     dezigzagBlocks = dezigzag(bitstream)
     quantizedBlocks = dequantization(dezigzagBlocks)
     idctBlocks = applyIDCT(quantizedBlocks)
-    result = reassembleFromBlocks(idctBlocks)
+    result = reassembleFromBlocks(idctBlocks, header)
     return result
 
 
-def reassembleFromBlocks(blockDict):
-
-    frames = blockDict["frames"]
+def reassembleFromBlocks(blockDict, header):
 
     newDict={}
-    newDict["Y"]=np.ndarray((frames, blockDict["luma_frame_size"][0], blockDict["luma_frame_size"][1]))
-    newDict["U"]=np.ndarray((frames, blockDict["chroma_frame_size"][0], blockDict["chroma_frame_size"][1]))
-    newDict["V"]=np.ndarray((frames, blockDict["chroma_frame_size"][0], blockDict["chroma_frame_size"][1]))
+    newDict["Y"]=np.ndarray((header.frameCount, header.lumaSize[0], header.lumaSize[1]))
+    newDict["U"]=np.ndarray((header.frameCount, header.chromaSize[0], header.chromaSize[1]))
+    newDict["V"]=np.ndarray((header.frameCount, header.chromaSize[0], header.chromaSize[1]))
 
     for component in newDict:
 
