@@ -21,6 +21,9 @@ def quantizationVectorLength(x, y):
 def quantizationScaled(x, y):
     return 1
 
+def quantizationNone(x, y):
+    return 1
+
 def get_quantization_matrix(block_size, quant_func):
 
     if quant_func == quantizationScaled:
@@ -35,4 +38,4 @@ def get_quantization_matrix(block_size, quant_func):
     return quantization_matrix
 
 
-DefaultQuantizationFunction = quantizationScaled
+DefaultQuantizationFunction = quantizationNone

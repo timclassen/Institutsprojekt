@@ -11,6 +11,11 @@ import os
 def encode_and_decode_video(yuv_video_path):
 
     original_video = read_yuv_video(yuv_video_path)
+    original_video = {
+        "Y": original_video["Y"][:2],
+        "U": original_video["U"][:2],
+        "V": original_video["V"][:2]
+    }
 
     header = Header()
     header.lumaSize = (original_video["Y"].shape[1], original_video["Y"].shape[2])

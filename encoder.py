@@ -15,7 +15,7 @@ def encoder(yuv_vid, header):
     blockData = divide_in_blocks(yuv_vid, (32,64))
     dctBlocks = applyDCT(blockData)
     quantizedBlocks = quantization(dctBlocks)
-    bitstream = zigzag(quantizedBlocks, header)
+    bitstream = entropyCompress(quantizedBlocks, header)
     return bitstream
 
 
@@ -48,7 +48,7 @@ def applyDCT(blocks):
     for component in ["Y", "U", "V"]:
 
         for block in blocks[component]:
-            blocks[component][block] = dct(dct(blocks[component][block].T, norm="ortho").T, norm="ortho")
+            blocks[component][block] = dct(dct(blocks[component][block].T.astype("int64"), norm="ortho").T, norm="ortho") / np.sqrt(blocks[component][block].shape[0] * blocks[component][block].shape[1])
 
     return blocks
 
@@ -66,6 +66,9 @@ def quantization(blocks):
     return blocks
 
 
+def writeByte(x, stream):
+    stream[0] = x
+
 def writeShort(x, stream):
     stream[0] = x & 0xFF
     stream[1] = x >> 8
@@ -75,7 +78,13 @@ def inplaceCompress(block, stream, dcPred):
     '''
         The first element is the DC component, the rest is AC
         For DC, do a prediction-based scheme
-        For AC, compress data via 
+        For AC, compress data as follows:
+        ESXXZZZZ [XXXXXXXX]
+        E: Extended sequence
+        S: Sign bit
+        X: Difference in 2s complement
+        Z: Zero run length
+        EOB is encoded as 11001111 == 0xCF
     '''
     dcDelta = block[0] - dcPred
     dcPred = block[0]
@@ -83,51 +92,78 @@ def inplaceCompress(block, stream, dcPred):
 
     eob = False
     acIndex = 1
-    cursor = 1
+    cursor = 2
+    blockSize = len(block)
 
-    while (acIndex < block.size()):
+    while (acIndex < blockSize):
         
         ac = block[acIndex]
         acIndex += 1
+        zeroes = -1
+        sign = ac < 0
+        
+        if sign:
+            ac = -ac
 
-        if (ac == 0):
+        #Count number of trailing zeroes
+        for i in range(16):
 
-            zeroDistance = 0
+            if acIndex >= blockSize:
+                zeroes = i
+                break
 
-            for i in range(126):
+            if block[acIndex] != 0:
+                zeroes = i
+                break
 
-                if (acIndex >= block.size()):
-                    stream[cursor] = 0xFF
-                    return cursor + 1
-                
-                if (block[acIndex] != 0):
-                    zeroDistance = i + 1
+            acIndex += 1
+
+        #Continue counting if EOB
+        if ac == 0 and zeroes == -1:
+
+            eob = True
+            scanIndex = acIndex
+            
+            while scanIndex < blockSize:
+
+                if block[scanIndex] != 0:
+                    eob = False
+                    zeroes = 15
                     break
 
-                acIndex += 1
+                scanIndex += 1
 
+            if eob:
+                writeByte(0xCF, stream[cursor:])
+                return cursor + 1
 
-            if (zeroDistance == 0):
+        #We have our zero count now, encode it
 
-                j = acIndex
+        if (abs(ac) <= 3):
+            #No extended sequence
+            seq = ((ac & 0x3) << 4) | zeroes
 
-                while (j < block.size()):
+            if sign:
+                seq |= 0x40
 
-                    if (block[j] != 0):
-                        stream[cursor] = 0xFF
-                        return cursor + 1
+            writeByte(seq, stream[cursor:])
+            cursor += 1
 
-                    j += 1
-
-            stream[cursor] = zeroDistance
-            writeShort(block[acIndex], stream[cursor + 1:])
-        
         else:
+            #Extended sequence, split value
+            if (ac > 1023):
+                ac = 1023
 
-            stream[cursor] = 0
-            writeShort(ac, stream[cursor + 1:])
+            j0 = ac & 0xFF
+            j1 = ac >> 8
 
-        cursor += 3
+            writeByte(0x80 | (sign << 6) | (j1 << 4) | zeroes, stream[cursor:])
+            writeByte(j0, stream[cursor + 1:])
+            cursor += 2
+
+    return cursor
+
+
 
         
 
@@ -135,7 +171,7 @@ def inplaceCompress(block, stream, dcPred):
 
 
 
-def zigzag(blocks, header):
+def entropyCompress(blocks, header):
 
     '''
         We have to take metadata into account, such as:
@@ -147,7 +183,7 @@ def zigzag(blocks, header):
     totalSize = header.frameCount * (header.lumaSize[0] * header.lumaSize[1] + header.chromaSize[0] * header.chromaSize[1] * 2) * 2
 
     for component in ["Y", "U", "V"]:
-        totalSize += blocks[component].size() * 2
+        totalSize += len(blocks[component].keys()) * 2
 
     bitstream = np.empty(totalSize, dtype=np.uint8)
     cursor = 0
@@ -157,6 +193,7 @@ def zigzag(blocks, header):
     for component in ["Y", "U", "V"]:
 
         dcPrediction = 0
+        frame = 0
         
         for key, block in blocks[component].items():
             
@@ -214,4 +251,4 @@ def zigzag(blocks, header):
             #Move cursor
             cursor += compressedSize
 
-    return bitstream
+    return bitstream[:cursor]
