@@ -2,11 +2,15 @@
 import numpy as np
 from scipy.fftpack import idct
 import quantization as quant
+import zigzag as zz
+from header import Header
 
 
-def decoder(bitstream, header):
 
-    dezigzagBlocks = entropyDecompress(bitstream)
+def decoder(bitstream):
+
+    header = readStreamHeader(bitstream)
+    dezigzagBlocks = entropyDecompress(bitstream, header)
     quantizedBlocks = dequantization(dezigzagBlocks)
     idctBlocks = applyIDCT(quantizedBlocks)
     result = reassembleFromBlocks(idctBlocks, header)
@@ -15,12 +19,13 @@ def decoder(bitstream, header):
 
 def reassembleFromBlocks(blockDict, header):
 
-    newDict={}
-    newDict["Y"]=np.ndarray((header.frameCount, header.lumaSize[0], header.lumaSize[1]))
-    newDict["U"]=np.ndarray((header.frameCount, header.chromaSize[0], header.chromaSize[1]))
-    newDict["V"]=np.ndarray((header.frameCount, header.chromaSize[0], header.chromaSize[1]))
+    video = {
+        "Y": np.ndarray((header.frameCount, header.lumaSize[0], header.lumaSize[1]), dtype="uint8"),
+        "U": np.ndarray((header.frameCount, header.chromaSize[0], header.chromaSize[1]), dtype="uint8"),
+        "V": np.ndarray((header.frameCount, header.chromaSize[0], header.chromaSize[1]), dtype="uint8")
+    }
 
-    for component in newDict:
+    for component in video:
 
         for block, blockData in blockDict[component].items():
 
@@ -28,9 +33,9 @@ def reassembleFromBlocks(blockDict, header):
             x = block[1]
             y = block[2]
 
-            newDict[component][frame, x:x+blockData.shape[0], y:y+blockData.shape[1]] = blockData
+            video[component][frame, x:x+blockData.shape[0], y:y+blockData.shape[1]] = np.clip(np.round(blockData), 0, 255)
 
-    return newDict
+    return video
 
 
 def applyIDCT(blocks):
@@ -38,29 +43,36 @@ def applyIDCT(blocks):
     for component in ["Y", "U", "V"]:
 
         for block in blocks[component]:
-            blocks[component][block] = idct(idct(blocks[component][block].T, norm="ortho").T, norm="ortho")
+            blocks[component][block] = idct(idct(blocks[component][block].T).T)
 
     return blocks
 
 
 def dequantization(blocks):
+
     quantization_matrices = {}
 
     for component in ["Y", "U", "V"]:
         for key in blocks[component]:
             blockSize = blocks[component][key].shape
             if blockSize not in quantization_matrices:
-                quantization_matrices[blockSize] = quant.get_quantization_matrix(blockSize, quant.DefaultQuantizationFunction)
+                quantization_matrices[blockSize] = quant.getQuantizationMatrix(blockSize, quant.DefaultQuantizationFunction)
             blocks[component][key] *= quantization_matrices[blockSize]
  
     return blocks
 
 
+def readByte(stream):
+    return stream[0]
+
 def readShort(stream):
     return stream[0] | (stream[1] << 8)
 
+def readInt(stream):
+    return stream[0] | (stream[1] << 8) | (stream[2] << 16) | (stream[3] << 24)
+
     
-def inplaceDecompress(dcPred, stream, block):
+def inplaceDecompress(dcPred, stream, block, zigzag):
     '''
         The first element is the DC component, the rest is AC
         For DC, do a prediction-based scheme
@@ -70,7 +82,7 @@ def inplaceDecompress(dcPred, stream, block):
         S: Sign bit
         X: Difference in 2s complement
         Z: Zero run length
-        EOB is encoded as 11001111 == 0xCF
+        EOB is encoded as 01001111 == 0x4F
     '''
     dcDelta = readShort(stream)
     dc = dcDelta + dcPred
@@ -79,15 +91,15 @@ def inplaceDecompress(dcPred, stream, block):
 
     acIndex = 1
     cursor = 2
-    totalCoeffs = block.shape[0]
+    totalCoeffs = len(block)
 
     while acIndex < totalCoeffs:
-        
-        value = stream[cursor]
+
+        value = readByte(stream[cursor:])
         cursor += 1
 
         #Check if we had EOB
-        if value == 0xCF:
+        if value == 0x4F:
             return cursor
 
         zeroes = value & 0xF
@@ -96,7 +108,7 @@ def inplaceDecompress(dcPred, stream, block):
         #Check whether we have an extended sequence
         if value & 0x80:
 
-            extValue = stream[cursor]
+            extValue = readByte(stream[cursor:])
             cursor += 1
             value = extValue | (((value >> 4) & 0x3) << 8)
 
@@ -109,7 +121,7 @@ def inplaceDecompress(dcPred, stream, block):
         if sign:
             value = -value
 
-        block[acIndex] = value
+        block[zigzag[acIndex]] = value
         acIndex += zeroes + 1
 
     return cursor
@@ -117,42 +129,74 @@ def inplaceDecompress(dcPred, stream, block):
 
 
 
+def readStreamHeader(bitstream):
+
+    '''
+        The header has the following layout:
+        1) Luma Width
+        2) Luma Height
+        3) Chroma Width
+        4) Chroma Height
+        5) Frame Count
+    '''
+    headerStream = bitstream["H"]
+
+    header = Header()
+    header.lumaSize = (readInt(headerStream), readInt(headerStream[0x4:]))
+    header.chromaSize = (readInt(headerStream[0x8:]), readInt(headerStream[0xC:]))
+    header.frameCount = readInt(headerStream[0x10:])
+
+    header.lumaPixels = header.lumaSize[0] * header.lumaSize[1]
+    header.chromaPixels = header.chromaSize[0] * header.chromaSize[1]
+
+    return header
 
 
 
-def entropyDecompress(bitstream):
+def entropyDecompress(bitstream, header):
 
     blocks = {"Y": {}, "U": {}, "V": {}}
-    cursor = 0
+    dezigzagTransforms = {}
 
     for component in ["Y", "U", "V"]:
 
         subsampled = component == "V" or component == "U"
+        baseBlockDim = 4 if subsampled else 8
         dcPrediction = 0
+        cursor = 0
+        substream = bitstream[component]
 
-        for f in range(2):
+        frameID = 0
 
-            for i in range(12):
+        while cursor < len(bitstream[component]):
 
-                ix = i * 32
+            #Read block information
+            sizeCompressed = readByte(substream[cursor:])
+            x = readShort(substream[cursor + 1:])
+            y = readShort(substream[cursor + 3:])
 
-                if subsampled:
-                    ix //= 2
+            cursor += 5
 
-                for j in range(6):
+            blockWidth = (baseBlockDim << (sizeCompressed & 0x3)).astype("int32")
+            blockHeight = (baseBlockDim << ((sizeCompressed >> 2) & 0x3)).astype("int32")
+            newFrame = sizeCompressed & 0x80
 
-                    iy = j * 64
+            if newFrame:
+                frameID += 1
 
-                    if subsampled:
-                        iy //= 2
+            blockKey = (frameID, x, y)
+            blockSize = (blockWidth, blockHeight)
 
-                    blockWidth =  bitstream[cursor + 0]
-                    blockHeight = bitstream[cursor + 1]
-                    cursor += 2
+            totalPixels = blockWidth * blockHeight
 
-                    buffer = np.zeros(blockWidth.astype("int32") * blockHeight, dtype=np.int32)
-                    cursor += inplaceDecompress(dcPrediction, bitstream[cursor:], buffer)
+            if blockSize not in dezigzagTransforms:
+                dezigzagTransforms[blockSize] = zz.dezigzagTransform(blockSize)
 
-                    blocks[component][(f, ix, iy)] = np.reshape(buffer, (blockWidth, blockHeight))
+            buffer = np.zeros(totalPixels, dtype=np.float64)
+
+            compressedSize = inplaceDecompress(dcPrediction, substream[cursor:], buffer, dezigzagTransforms[blockSize])
+            cursor += compressedSize
+
+            blocks[component][blockKey] = np.reshape(buffer, (blockWidth, blockHeight))
 
     return blocks

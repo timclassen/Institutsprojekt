@@ -4,25 +4,30 @@ import numpy as np
 import header
 from scipy.fftpack import dct
 import quantization as quant
+import zigzag as zz
 import time
 
 
 
-def encoder(yuv_vid, header):
+def encoder(video, header):
     '''
         Encodes the video and returns a bitstream
     '''
-    blockData = divide_in_blocks(yuv_vid, (32,64))
+    blockData = divideInBlocks(video, (8, 8))
     dctBlocks = applyDCT(blockData)
     quantizedBlocks = quantization(dctBlocks)
     bitstream = entropyCompress(quantizedBlocks, header)
     return bitstream
 
 
-def divide_in_blocks(vid, block_size=(64, 64)):
+def divideInBlocks(vid, blockSize=(64, 64)):
 
     newDict = {}
-    blockSizes = {"Y":block_size, "U":(block_size[0] // (vid["Y"].shape[1] // vid["U"].shape[1]), block_size[1] // (vid["Y"].shape[2] // vid["U"].shape[2])), "V":(block_size[0] // (vid["Y"].shape[1] // vid["V"].shape[1]), block_size[1] // (vid["Y"].shape[2] // vid["V"].shape[2]))}
+    blockSizes = {
+        "Y": blockSize,
+        "U": (blockSize[0] // (vid["Y"].shape[1] // vid["U"].shape[1]), blockSize[1] // (vid["Y"].shape[2] // vid["U"].shape[2])),
+        "V": (blockSize[0] // (vid["Y"].shape[1] // vid["V"].shape[1]), blockSize[1] // (vid["Y"].shape[2] // vid["V"].shape[2]))
+    }
 
     for component in vid:
 
@@ -38,7 +43,7 @@ def divide_in_blocks(vid, block_size=(64, 64)):
         for frame in range(0, vid[component].shape[0]):
             for x in range(0, vid[component].shape[1], compBlockSize[0]):
                 for y in range(0, vid[component].shape[2], compBlockSize[1]):
-                    newDict[component][(frame, x, y)] = vid[component][frame, x:x + compBlockSize[0], y:y + compBlockSize[1]]
+                    newDict[component][(frame, x, y)] = vid[component][frame, x:x + compBlockSize[0], y:y + compBlockSize[1]].astype('float64')
 
     return newDict
 
@@ -48,7 +53,7 @@ def applyDCT(blocks):
     for component in ["Y", "U", "V"]:
 
         for block in blocks[component]:
-            blocks[component][block] = dct(dct(blocks[component][block].T.astype("int64"), norm="ortho").T, norm="ortho") / np.sqrt(blocks[component][block].shape[0] * blocks[component][block].shape[1])
+            blocks[component][block] = dct(dct(blocks[component][block].T, norm="ortho").T, norm="ortho") / np.sqrt(blocks[component][block].shape[0] * blocks[component][block].shape[1])
 
     return blocks
 
@@ -60,7 +65,7 @@ def quantization(blocks):
         for key in blocks[component]:
             blockSize = blocks[component][key].shape
             if blockSize not in quantization_matrices:
-                quantization_matrices[blockSize] = quant.get_quantization_matrix(blockSize, quant.DefaultQuantizationFunction)
+                quantization_matrices[blockSize] = quant.getQuantizationMatrix(blockSize, quant.DefaultQuantizationFunction)
             blocks[component][key] = np.round(blocks[component][key] / quantization_matrices[blockSize])
 
     return blocks
@@ -73,8 +78,14 @@ def writeShort(x, stream):
     stream[0] = x & 0xFF
     stream[1] = x >> 8
 
+def writeInt(x, stream):
+    stream[0] = x & 0xFF
+    stream[1] = (x >> 8) & 0xFF
+    stream[2] = (x >> 16) & 0xFF
+    stream[3] = (x >> 24) & 0xFF
 
-def inplaceCompress(block, stream, dcPred):
+
+def inplaceCompress(block, stream, dcPred, zigzag):
     '''
         The first element is the DC component, the rest is AC
         For DC, do a prediction-based scheme
@@ -84,7 +95,7 @@ def inplaceCompress(block, stream, dcPred):
         S: Sign bit
         X: Difference in 2s complement
         Z: Zero run length
-        EOB is encoded as 11001111 == 0xCF
+        EOB is encoded as 01001111 == 0x4F
     '''
     dcDelta = block[0] - dcPred
     dcPred = block[0]
@@ -97,7 +108,7 @@ def inplaceCompress(block, stream, dcPred):
 
     while (acIndex < blockSize):
         
-        ac = block[acIndex]
+        ac = block[zigzag[acIndex]]
         acIndex += 1
         zeroes = -1
         sign = ac < 0
@@ -112,30 +123,35 @@ def inplaceCompress(block, stream, dcPred):
                 zeroes = i
                 break
 
-            if block[acIndex] != 0:
+            if block[zigzag[acIndex]] != 0:
                 zeroes = i
                 break
 
             acIndex += 1
 
         #Continue counting if EOB
-        if ac == 0 and zeroes == -1:
+        if zeroes == -1:
 
-            eob = True
-            scanIndex = acIndex
-            
-            while scanIndex < blockSize:
+            zeroes = 15
+            acIndex -= 1
 
-                if block[scanIndex] != 0:
-                    eob = False
-                    zeroes = 15
-                    break
+            if ac == 0:
 
-                scanIndex += 1
+                eob = True
+                scanIndex = acIndex
+                
+                while scanIndex < blockSize:
 
-            if eob:
-                writeByte(0xCF, stream[cursor:])
-                return cursor + 1
+                    if block[zigzag[acIndex]] != 0:
+                        eob = False
+                        break
+
+                    scanIndex += 1
+
+                if eob:
+                    writeByte(0x4F, stream[cursor:])
+                    return cursor + 1
+
 
         #We have our zero count now, encode it
 
@@ -166,6 +182,24 @@ def inplaceCompress(block, stream, dcPred):
 
 
         
+def createStreamHeader(header):
+
+    '''
+        The header has the following layout:
+        1) Luma Width
+        2) Luma Height
+        3) Chroma Width
+        4) Chroma Height
+        5) Frame Count
+    '''
+    binaryHeader = np.empty(4 * 5, dtype='uint8')
+    writeInt(header.lumaSize[0], binaryHeader)
+    writeInt(header.lumaSize[1], binaryHeader[0x4:])
+    writeInt(header.chromaSize[0], binaryHeader[0x8:])
+    writeInt(header.chromaSize[1], binaryHeader[0xC:])
+    writeInt(header.frameCount, binaryHeader[0x10:])
+
+    return binaryHeader
 
 
 
@@ -180,20 +214,28 @@ def entropyCompress(blocks, header):
         For our bitstream size, expect the worst by having zero compression
     '''
 
-    totalSize = header.frameCount * (header.lumaSize[0] * header.lumaSize[1] + header.chromaSize[0] * header.chromaSize[1] * 2) * 2
+    lumaSize = header.lumaPixels * header.frameCount * 2 + len(blocks["Y"]) * 5
+    chromaSize = header.chromaPixels * header.frameCount * 2 + len(blocks["U"]) * 5
+
+    bitstream = {
+        "H": createStreamHeader(header)
+    }
+
+    zigzagTransforms = {}
 
     for component in ["Y", "U", "V"]:
-        totalSize += len(blocks[component].keys()) * 2
 
-    bitstream = np.empty(totalSize, dtype=np.uint8)
-    cursor = 0
-
-    zigzagIndices = {}
-
-    for component in ["Y", "U", "V"]:
-
+        cursor = 0
         dcPrediction = 0
         frame = 0
+
+        subsampled = component == "V" or component == "U"
+        baseBlockShift = 3 if subsampled else 4
+
+        streamSize = lumaSize if component == "Y" else chromaSize
+        substream = np.empty(lumaSize if component == "Y" else chromaSize, dtype=np.uint8)
+
+        oldFrameID = 0
         
         for key, block in blocks[component].items():
             
@@ -201,54 +243,40 @@ def entropyCompress(blocks, header):
             pixelCount = blockSize[0] * blockSize[1]
 
             #If block transform indices haven't been calculated yet
-            if blockSize not in zigzagIndices:
-
-                transformArray = np.empty(pixelCount, dtype='uint32, uint32')
-                i = 0
-                
-                #Horizontal case
-                for x in range(blockSize[0] - 1):
-                    curx = x
-                    cury = 0
-                    while curx >= 0 and cury < blockSize[1]:
-                        transformArray[i] = (curx, cury)
-                        i += 1
-                        curx -= 1
-                        cury += 1
-
-                #Vertical case
-                for y in range(blockSize[1]):
-                    cury = y
-                    curx = blockSize[0] - 1
-                    while curx >= 0 and cury < blockSize[1]:
-                        transformArray[i] = (curx, cury)
-                        i += 1
-                        curx -= 1
-                        cury += 1
+            if blockSize not in zigzagTransforms:
 
                 #Add transform array to known zigzag sequences
-                zigzagIndices[blockSize] = transformArray
+                zigzagTransforms[blockSize] = zz.zigzagTransform(blockSize)
 
             #Prepend block information
-            bitstream[cursor + 0] = blockSize[0]
-            bitstream[cursor + 1] = blockSize[1]
-            cursor += 2
+            newFrame = oldFrameID != key[0]
 
-            buffer = np.empty(pixelCount, dtype=np.int32)
+            if newFrame:
+                oldFrameID += 1
 
-            #Iterate over all pixels inside a single block
-            for n in range(pixelCount):
+            writeByte((blockSize[0] >> baseBlockShift).bit_length() | ((blockSize[1] >> baseBlockShift).bit_length() << 2) | (newFrame << 7), substream[cursor:])
+            writeShort(key[1], substream[cursor + 1:])
+            writeShort(key[2], substream[cursor + 3:])
 
-                #Obtain the zigzag index
-                index = zigzagIndices[blockSize][n]
+            cursor += 5
 
-                #Write the pixel to the zigzag destination
-                buffer[n] = block[index[0], index[1]]
+            zigzag = zigzagTransforms[blockSize]
+            buffer = np.empty(pixelCount, dtype='int16')
+
+            bufferIndex = 0
+
+            for y in range(blockSize[1]):
+                for x in range(blockSize[0]):
+
+                    buffer[bufferIndex] = block[x, y]
+                    bufferIndex += 1
 
             #Compress
-            compressedSize = inplaceCompress(buffer, bitstream[cursor:], dcPrediction)
+            compressedSize = inplaceCompress(buffer, substream[cursor:], dcPrediction, zigzag)
 
             #Move cursor
             cursor += compressedSize
 
-    return bitstream[:cursor]
+        bitstream[component] = substream[:cursor]
+
+    return bitstream
