@@ -1,8 +1,10 @@
 # TODO: Put your implementation of the encoder here
 from pickletools import uint8
 import numpy as np
+from bitbuffer import BitBuffer
 import header
 from scipy.fftpack import dct
+from huffman import HuffmanEncoder
 import quantization as quant
 import zigzag as zz
 import time
@@ -13,7 +15,7 @@ def encoder(video, header):
     '''
         Encodes the video and returns a bitstream
     '''
-    blockData = divideInBlocks(video, (8, 8))
+    blockData = divideInBlocks(video, (16, 16))
     dctBlocks = applyDCT(blockData)
     quantizedBlocks = quantization(dctBlocks)
     bitstream = entropyCompress(quantizedBlocks, header)
@@ -53,7 +55,7 @@ def applyDCT(blocks):
     for component in ["Y", "U", "V"]:
 
         for block in blocks[component]:
-            blocks[component][block] = dct(dct(blocks[component][block].T, norm="ortho").T, norm="ortho") / np.sqrt(blocks[component][block].shape[0] * blocks[component][block].shape[1])
+            blocks[component][block] = dct(dct(blocks[component][block], axis = 0, norm = 'ortho'), axis = 1, norm = 'ortho')
 
     return blocks
 
@@ -85,7 +87,7 @@ def writeInt(x, stream):
     stream[3] = (x >> 24) & 0xFF
 
 
-def inplaceCompress(block, stream, dcPred, zigzag):
+def inplaceCompress(block, stream, dcPred, zigzag, dcEncoder, acEncoder):
     '''
         The first element is the DC component, the rest is AC
         For DC, do a prediction-based scheme
@@ -99,6 +101,9 @@ def inplaceCompress(block, stream, dcPred, zigzag):
     '''
     dcDelta = block[0] - dcPred
     dcPred = block[0]
+    
+    dcEncoder.recordToken(dcDelta & 0xFF)
+    dcEncoder.recordToken(dcDelta >> 8)
     writeShort(dcDelta, stream)
 
     eob = False
@@ -149,6 +154,7 @@ def inplaceCompress(block, stream, dcPred, zigzag):
                     scanIndex += 1
 
                 if eob:
+                    acEncoder.recordToken(0x4F)
                     writeByte(0x4F, stream[cursor:])
                     return cursor + 1
 
@@ -156,24 +162,31 @@ def inplaceCompress(block, stream, dcPred, zigzag):
         #We have our zero count now, encode it
 
         if (abs(ac) <= 3):
+
             #No extended sequence
             seq = ((ac & 0x3) << 4) | zeroes
 
             if sign:
                 seq |= 0x40
 
+            acEncoder.recordToken(seq)
             writeByte(seq, stream[cursor:])
             cursor += 1
 
         else:
+
             #Extended sequence, split value
             if (ac > 1023):
                 ac = 1023
 
             j0 = ac & 0xFF
             j1 = ac >> 8
+            ext = 0x80 | (sign << 6) | (j1 << 4) | zeroes
 
-            writeByte(0x80 | (sign << 6) | (j1 << 4) | zeroes, stream[cursor:])
+            acEncoder.recordToken(ext)
+            acEncoder.recordToken(j0)
+
+            writeByte(ext, stream[cursor:])
             writeByte(j0, stream[cursor + 1:])
             cursor += 2
 
@@ -225,18 +238,23 @@ def entropyCompress(blocks, header):
 
     for component in ["Y", "U", "V"]:
 
-        cursor = 0
-        dcPrediction = 0
         frame = 0
+        cursor = 0
+        oldFrameID = 0
+        dcPrediction = 0
 
         subsampled = component == "V" or component == "U"
         baseBlockShift = 3 if subsampled else 4
+        baseBlockDim = 4 if subsampled else 8
 
-        streamSize = lumaSize if component == "Y" else chromaSize
-        substream = np.empty(lumaSize if component == "Y" else chromaSize, dtype=np.uint8)
+        streamSize = chromaSize if subsampled else lumaSize
+        substream = np.empty(streamSize, dtype=np.uint8)
 
-        oldFrameID = 0
+        headerEncoder = HuffmanEncoder()
+        dcEncoder = HuffmanEncoder()
+        acEncoder = HuffmanEncoder()
         
+        #Compression, stage 1
         for key, block in blocks[component].items():
             
             blockSize = block.shape
@@ -254,7 +272,15 @@ def entropyCompress(blocks, header):
             if newFrame:
                 oldFrameID += 1
 
-            writeByte((blockSize[0] >> baseBlockShift).bit_length() | ((blockSize[1] >> baseBlockShift).bit_length() << 2) | (newFrame << 7), substream[cursor:])
+            compressedBlockInfo = (blockSize[0] >> baseBlockShift).bit_length() | ((blockSize[1] >> baseBlockShift).bit_length() << 2) | (newFrame << 7)
+
+            headerEncoder.recordToken(compressedBlockInfo)
+            headerEncoder.recordToken(key[1] & 0xFF)
+            headerEncoder.recordToken(key[1] >> 8)
+            headerEncoder.recordToken(key[2] & 0xFF)
+            headerEncoder.recordToken(key[2] >> 8)
+
+            writeByte(compressedBlockInfo, substream[cursor:])
             writeShort(key[1], substream[cursor + 1:])
             writeShort(key[2], substream[cursor + 3:])
 
@@ -271,12 +297,78 @@ def entropyCompress(blocks, header):
                     buffer[bufferIndex] = block[x, y]
                     bufferIndex += 1
 
-            #Compress
-            compressedSize = inplaceCompress(buffer, substream[cursor:], dcPrediction, zigzag)
-
-            #Move cursor
+            compressedSize = inplaceCompress(buffer, substream[cursor:], dcPrediction, zigzag, dcEncoder, acEncoder)
             cursor += compressedSize
 
-        bitstream[component] = substream[:cursor]
+        #Build huffman trees
+        headerEncoder.buildTree()
+        dcEncoder.buildTree()
+        acEncoder.buildTree()
+
+        #Compression, stage 2
+        bitBuffer = BitBuffer()
+
+        #Reset stream
+        substream = substream[:cursor]
+        cursor = 0
+
+        a = 0
+        b = 0
+
+        while cursor < substream.size:
+
+            sizeCompressed = substream[cursor]
+
+            blockWidth = (baseBlockDim << (sizeCompressed & 0x3)).astype("int32")
+            blockHeight = (baseBlockDim << ((sizeCompressed >> 2) & 0x3)).astype("int32")
+
+            #Write frame header
+            for i in range(5):
+                (code, length) = headerEncoder.getCode(substream[cursor + i])
+                bitBuffer.write(length, code)
+                b += length
+
+            cursor += 5
+
+            #Write DC coefficient
+            for i in range(2):
+                (code, length) = dcEncoder.getCode(substream[cursor + i])
+                bitBuffer.write(length, code)
+                b += length
+
+            cursor += 2
+            a += 56
+
+            #Huffman-compress AC coefficients
+            acIndex = 1
+            totalCoeffs = blockWidth * blockHeight
+
+            while acIndex < totalCoeffs:
+
+                v = substream[cursor]
+
+                (code, length) = acEncoder.getCode(v)
+                bitBuffer.write(length, code)
+                a += 8
+                b += length
+                cursor += 1
+
+                #Extended sequence
+                if v & 0x80:
+
+                    (codeExt, lengthExt) = acEncoder.getCode(substream[cursor])
+                    bitBuffer.write(lengthExt, codeExt)
+                    a += 8
+                    b += lengthExt
+                    cursor += 1
+
+                #EOB
+                elif v == 0x4F:
+                    break
+
+                acIndex += (v & 0xF) + 1
+
+        bitstream[component] = bitBuffer.getBuffer()
+        print("Raw: {}, Huffman: {}".format(a, b))
 
     return bitstream

@@ -43,7 +43,7 @@ def applyIDCT(blocks):
     for component in ["Y", "U", "V"]:
 
         for block in blocks[component]:
-            blocks[component][block] = idct(idct(blocks[component][block].T).T)
+            blocks[component][block] = idct(idct(blocks[component][block], axis = 0, norm = 'ortho'), axis = 1, norm = 'ortho')
 
     return blocks
 

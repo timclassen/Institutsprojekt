@@ -46,7 +46,7 @@ def encode_and_decode_video(yuv_video_path):
 
     print("Size of original video:", original_video_size)
     print("Size of bitstream:", bitstreamSize)
-    print("Compression ratio:", bitstreamSize / original_video_size)
+    print("Compression ratio:", original_video_size / bitstreamSize)
     print("PSNR:", psnr_yuv(original_video, decoded_video))
 
 
