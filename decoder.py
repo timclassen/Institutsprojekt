@@ -62,15 +62,6 @@ def dequantization(blocks):
     return blocks
 
 
-def readByte(stream):
-    return stream[0]
-
-def readShort(stream):
-    return stream[0] | (stream[1] << 8)
-
-def readInt(stream):
-    return stream[0] | (stream[1] << 8) | (stream[2] << 16) | (stream[3] << 24)
-
     
 def inplaceDecompress(dcPred, stream, block, zigzag):
     '''

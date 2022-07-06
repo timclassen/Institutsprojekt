@@ -11,27 +11,22 @@ import os
 def encode_and_decode_video(yuv_video_path):
 
     original_video = read_yuv_video(yuv_video_path)
-    '''
+    
     original_video = {
         "Y": original_video["Y"][:2],
         "U": original_video["U"][:2],
         "V": original_video["V"][:2]
     }
-    '''
+    
     
     decodedOutPath = "tmp/decodedVid.yuv"
 
-    header = Header()
-    header.lumaSize = (original_video["Y"].shape[1], original_video["Y"].shape[2])
-    header.chromaSize = (original_video["U"].shape[1], original_video["U"].shape[2])
-    header.frameCount = original_video["Y"].shape[0]
-    header.lumaPixels = header.lumaSize[0] * header.lumaSize[1]
-    header.chromaPixels = header.chromaSize[0] * header.chromaSize[1]
 
-    print("Original size: {}".format(header.frameCount * (header.lumaSize[0] * header.lumaSize[1] + 2 * header.chromaSize[0] * header.chromaSize[1])))
+    header = Header((original_video["Y"].shape[1], original_video["Y"].shape[2]), (original_video["U"].shape[1], original_video["U"].shape[2]), original_video["Y"].shape[0])
+    print("Original size: {}".format(header.totalPixels))
 
     bitstream = encoder(original_video, header)
-    bitstreamSize = sum(len(v) for k, v in bitstream.items())
+    bitstreamSize = bitstream.size
 
     print("Encoded")
     print("Compressed size: {}".format(bitstreamSize))

@@ -30,15 +30,15 @@ def quantizationDCOnly(x, y):
 def getQuantizationMatrix(blockSize, quantFunc):
 
     if quantFunc == quantizationScaled:
-        return cv.resize(baseQuantizationMatrix, dsize = blockSize, interpolation = cv.INTER_LINEAR_EXACT)
+        return cv.resize(baseQuantizationMatrix, dsize = (blockSize[1], blockSize[0]), interpolation = cv.INTER_LINEAR_EXACT)
 
-    quantization_matrix = np.zeros(blockSize)
+    quantizationMatrix = np.empty(blockSize, dtype = np.float64)
 
-    for y in range(blockSize[0]):
-        for x in range(blockSize[1]):
-            quantization_matrix[y, x] = quantFunc(x, y)
+    for y in range(blockSize[1]):
+        for x in range(blockSize[0]):
+            quantizationMatrix[x, y] = quantFunc(x, y)
 
-    return quantization_matrix
+    return quantizationMatrix
 
 
 DefaultQuantizationFunction = quantizationScaled

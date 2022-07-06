@@ -1,13 +1,14 @@
 # TODO: Put your implementation of the encoder here
-from pickletools import uint8
+from base64 import encode
+from bz2 import compress
+from venv import create
 import numpy as np
 from bitbuffer import BitBuffer
-import header
 from scipy.fftpack import dct
 from huffman import HuffmanEncoder
 import quantization as quant
+from utils import *
 import zigzag as zz
-import time
 
 
 
@@ -61,33 +62,26 @@ def applyDCT(blocks):
 
 
 def quantization(blocks):
-    quantization_matrices = {}
+
+    quantizationMatrices = {}
 
     for component in ["Y", "U", "V"]:
-        for key in blocks[component]:
-            blockSize = blocks[component][key].shape
-            if blockSize not in quantization_matrices:
-                quantization_matrices[blockSize] = quant.getQuantizationMatrix(blockSize, quant.DefaultQuantizationFunction)
-            blocks[component][key] = np.round(blocks[component][key] / quantization_matrices[blockSize])
+
+        for key, block in blocks[component].items():
+
+            blockSize = block.shape
+
+            if blockSize not in quantizationMatrices:
+                quantizationMatrices[blockSize] = quant.getQuantizationMatrix(blockSize, quant.DefaultQuantizationFunction)
+
+            blocks[component][key] = np.round(block / quantizationMatrices[blockSize])
 
     return blocks
 
 
-def writeByte(x, stream):
-    stream[0] = x
-
-def writeShort(x, stream):
-    stream[0] = x & 0xFF
-    stream[1] = x >> 8
-
-def writeInt(x, stream):
-    stream[0] = x & 0xFF
-    stream[1] = (x >> 8) & 0xFF
-    stream[2] = (x >> 16) & 0xFF
-    stream[3] = (x >> 24) & 0xFF
 
 
-def inplaceCompress(block, stream, dcPred, zigzag, dcEncoder, acEncoder):
+def inplaceCompress(block, stream, dcPred, dcEncoder, acEncoder):
     '''
         The first element is the DC component, the rest is AC
         For DC, do a prediction-based scheme
@@ -99,68 +93,75 @@ def inplaceCompress(block, stream, dcPred, zigzag, dcEncoder, acEncoder):
         Z: Zero run length
         EOB is encoded as 01001111 == 0x4F
     '''
-    dcDelta = block[0] - dcPred
-    dcPred = block[0]
-    
-    dcEncoder.recordToken(dcDelta & 0xFF)
-    dcEncoder.recordToken(dcDelta >> 8)
-    writeShort(dcDelta, stream)
 
-    eob = False
-    acIndex = 1
-    cursor = 2
+    dcDelta = block[0] - dcPred.prediction
+    dcPred.prediction = block[0]
+
+    dcOffset = dcDelta < 0
+    dcAbsDelta = abs(dcDelta)
+    dcMagnitude = dcAbsDelta.item().bit_length()
+
+    coeffBaseDifference = [0, -1, -3, -7, -15, -31, -63, -127, -255, -511, -1023, -2047, -4095, -8191, -16383, -32767]
+    entropyPositiveBase = [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
+
+    dcEncoder.recordToken(dcMagnitude)
+    writeByte(dcMagnitude, stream)
+
+    cursor = 1
+
+    if dcMagnitude != 0:
+        
+        dcOffset = dcDelta - coeffBaseDifference[dcMagnitude] if dcDelta < entropyPositiveBase[dcMagnitude] else dcDelta
+        writeShort(dcOffset, stream[cursor:])
+
+        cursor += 2
+    
+    hasEOB = False
     blockSize = len(block)
+
+    eobIndex = blockSize - 1
+
+    while eobIndex > 0:
+
+        if block[eobIndex] != 0:
+            break
+
+        eobIndex -= 1
+
+    if eobIndex == 0:
+        hasEOB = True
+        blockSize = 0
+    elif eobIndex + 16 < blockSize:
+        hasEOB = True
+        blockSize = eobIndex + 1
+
+    
+    acIndex = 1
 
     while (acIndex < blockSize):
         
-        ac = block[zigzag[acIndex]]
+        ac = block[acIndex]
         acIndex += 1
-        zeroes = -1
+        zeroes = 15
         sign = ac < 0
         
         if sign:
             ac = -ac
 
         #Count number of trailing zeroes
-        for i in range(16):
+        for i in range(15):
 
             if acIndex >= blockSize:
                 zeroes = i
                 break
 
-            if block[zigzag[acIndex]] != 0:
+            if block[acIndex] != 0:
                 zeroes = i
                 break
 
             acIndex += 1
 
-        #Continue counting if EOB
-        if zeroes == -1:
-
-            zeroes = 15
-            acIndex -= 1
-
-            if ac == 0:
-
-                eob = True
-                scanIndex = acIndex
-                
-                while scanIndex < blockSize:
-
-                    if block[zigzag[acIndex]] != 0:
-                        eob = False
-                        break
-
-                    scanIndex += 1
-
-                if eob:
-                    acEncoder.recordToken(0x4F)
-                    writeByte(0x4F, stream[cursor:])
-                    return cursor + 1
-
-
         #We have our zero count now, encode it
-
         if (abs(ac) <= 3):
 
             #No extended sequence
@@ -190,12 +191,17 @@ def inplaceCompress(block, stream, dcPred, zigzag, dcEncoder, acEncoder):
             writeByte(j0, stream[cursor + 1:])
             cursor += 2
 
+    if hasEOB:
+        acEncoder.recordToken(0x4F)
+        writeByte(0x4F, stream[cursor:])
+        cursor += 1
+
     return cursor
 
 
 
         
-def createStreamHeader(header):
+def writeStreamHeader(header, bitBuffer: BitBuffer):
 
     '''
         The header has the following layout:
@@ -205,14 +211,11 @@ def createStreamHeader(header):
         4) Chroma Height
         5) Frame Count
     '''
-    binaryHeader = np.empty(4 * 5, dtype='uint8')
-    writeInt(header.lumaSize[0], binaryHeader)
-    writeInt(header.lumaSize[1], binaryHeader[0x4:])
-    writeInt(header.chromaSize[0], binaryHeader[0x8:])
-    writeInt(header.chromaSize[1], binaryHeader[0xC:])
-    writeInt(header.frameCount, binaryHeader[0x10:])
-
-    return binaryHeader
+    bitBuffer.write(32, header.lumaSize[0])
+    bitBuffer.write(32, header.lumaSize[1])
+    bitBuffer.write(32, header.chromaSize[0])
+    bitBuffer.write(32, header.chromaSize[1])
+    bitBuffer.write(32, header.frameCount)
 
 
 
@@ -227,148 +230,187 @@ def entropyCompress(blocks, header):
         For our bitstream size, expect the worst by having zero compression
     '''
 
-    lumaSize = header.lumaPixels * header.frameCount * 2 + len(blocks["Y"]) * 5
-    chromaSize = header.chromaPixels * header.frameCount * 2 + len(blocks["U"]) * 5
-
-    bitstream = {
-        "H": createStreamHeader(header)
-    }
+    compressBufferSize = header.lumaPixels + header.lumaPixels // 32 + (header.chromaPixels + header.chromaPixels // 8) * 2
+    compressBuffer = np.empty(compressBufferSize, dtype = np.uint8)
 
     zigzagTransforms = {}
+    zigzagBuffer = np.empty(64 * 64, dtype = np.int16)
 
-    for component in ["Y", "U", "V"]:
+    # Create bit buffer and write the stream header
+    bitBuffer = BitBuffer()
+    writeStreamHeader(header, bitBuffer)
 
-        frame = 0
+
+    # Rearrange block tables to [component][frame][x, y] -> block data
+    blockArrays = {}
+
+    for component, blockTable in blocks.items():
+
+        blockArrays[component] = {}
+
+        for (frame, x, y), block in blockTable.items():
+
+            if frame not in blockArrays[component]:
+                blockArrays[component][frame] = {}
+
+            blockArrays[component][frame][(x, y)] = block
+
+
+
+    # Loop over all frames
+    for frameID in range(header.frameCount):
+
+        newFrame = True
+
         cursor = 0
-        oldFrameID = 0
-        dcPrediction = 0
+        lumaEnd = 0
 
-        subsampled = component == "V" or component == "U"
-        baseBlockShift = 3 if subsampled else 4
-        baseBlockDim = 4 if subsampled else 8
-
-        streamSize = chromaSize if subsampled else lumaSize
-        substream = np.empty(streamSize, dtype=np.uint8)
-
-        headerEncoder = HuffmanEncoder()
+        biEncoder = HuffmanEncoder()
         dcEncoder = HuffmanEncoder()
         acEncoder = HuffmanEncoder()
-        
-        #Compression, stage 1
-        for key, block in blocks[component].items():
-            
-            blockSize = block.shape
-            pixelCount = blockSize[0] * blockSize[1]
 
-            #If block transform indices haven't been calculated yet
-            if blockSize not in zigzagTransforms:
+        # Squeeze
+        for component in ["Y", "U", "V"]:
 
-                #Add transform array to known zigzag sequences
-                zigzagTransforms[blockSize] = zz.zigzagTransform(blockSize)
+            dcPrediction = DCPredictor()
 
-            #Prepend block information
-            newFrame = oldFrameID != key[0]
+            luma = component == "Y"
+            baseBlockShift = 4 if luma else 3
 
-            if newFrame:
-                oldFrameID += 1
 
-            compressedBlockInfo = (blockSize[0] >> baseBlockShift).bit_length() | ((blockSize[1] >> baseBlockShift).bit_length() << 2) | (newFrame << 7)
+            for blockPos, block in sorted(blockArrays[component][frameID].items()):
 
-            headerEncoder.recordToken(compressedBlockInfo)
-            headerEncoder.recordToken(key[1] & 0xFF)
-            headerEncoder.recordToken(key[1] >> 8)
-            headerEncoder.recordToken(key[2] & 0xFF)
-            headerEncoder.recordToken(key[2] >> 8)
+                blockSize = block.shape
+                pixelCount = blockSize[0] * blockSize[1]
 
-            writeByte(compressedBlockInfo, substream[cursor:])
-            writeShort(key[1], substream[cursor + 1:])
-            writeShort(key[2], substream[cursor + 3:])
+                # Write block information
+                compressedBlockInfo = (blockSize[0] >> baseBlockShift).bit_length() | ((blockSize[1] >> baseBlockShift).bit_length() << 2) | (newFrame << 7)
+                newFrame = False
 
-            cursor += 5
+                biEncoder.recordToken(compressedBlockInfo)
+                writeByte(compressedBlockInfo, compressBuffer[cursor:])
+                cursor += 1
 
-            zigzag = zigzagTransforms[blockSize]
-            buffer = np.empty(pixelCount, dtype='int16')
+                # If block transform indices haven't been calculated yet
+                if blockSize not in zigzagTransforms:
 
-            bufferIndex = 0
+                    # Add transform array to known zigzag sequences
+                    zigzagTransforms[blockSize] = zz.zigzagTransform(blockSize)
 
-            for y in range(blockSize[1]):
-                for x in range(blockSize[0]):
+                # Calculate zigzag transform
+                zigzag = zigzagTransforms[blockSize]
+                flatBlock = np.reshape(block, pixelCount)
+                zigzagIndex = 0
 
-                    buffer[bufferIndex] = block[x, y]
-                    bufferIndex += 1
+                for i in range(pixelCount):
+                    zigzagBuffer[i] = flatBlock[zigzag[i]]
 
-            compressedSize = inplaceCompress(buffer, substream[cursor:], dcPrediction, zigzag, dcEncoder, acEncoder)
-            cursor += compressedSize
+                # Compress block
+                cursorAdvance = inplaceCompress(zigzagBuffer[:pixelCount], compressBuffer[cursor:], dcPrediction, dcEncoder, acEncoder)
+                cursor += cursorAdvance
 
-        #Build huffman trees
-        headerEncoder.buildTree()
+            if component == "Y":
+                lumaEnd = cursor
+
+
+        # Build huffman trees
+        biEncoder.buildTree()
         dcEncoder.buildTree()
         acEncoder.buildTree()
 
-        #Compression, stage 2
-        bitBuffer = BitBuffer()
+        # Write huffman tables
+        bitBuffer.flush()
+        huffmanStart = bitBuffer.size()
 
-        #Reset stream
-        substream = substream[:cursor]
-        cursor = 0
+        biEncoder.serialize(bitBuffer)
+        dcEncoder.serialize(bitBuffer)
+        acEncoder.serialize(bitBuffer)
 
-        a = 0
-        b = 0
+        bitBuffer.flush()
+        huffmanEnd = bitBuffer.size()
+        huffmanSize = huffmanEnd - huffmanStart
 
-        while cursor < substream.size:
+        # Setup statistics
+        uncompressedSize = cursor
+        compressedSize = 0
 
-            sizeCompressed = substream[cursor]
+        # Compress
+        compressCursor = 0
+        baseBlockDim = 8
+
+        while compressCursor < cursor:
+
+            if compressCursor >= lumaEnd:
+                baseBlockDim = 4
+
+            sizeCompressed = compressBuffer[compressCursor]
 
             blockWidth = (baseBlockDim << (sizeCompressed & 0x3)).astype("int32")
             blockHeight = (baseBlockDim << ((sizeCompressed >> 2) & 0x3)).astype("int32")
 
-            #Write frame header
-            for i in range(5):
-                (code, length) = headerEncoder.getCode(substream[cursor + i])
-                bitBuffer.write(length, code)
-                b += length
+            # Write frame header
+            (frameCode, frameLength) = biEncoder.getCode(sizeCompressed)
+            bitBuffer.write(frameLength, frameCode)
 
-            cursor += 5
+            compressedSize += frameLength
+            compressCursor += 1
 
-            #Write DC coefficient
-            for i in range(2):
-                (code, length) = dcEncoder.getCode(substream[cursor + i])
-                bitBuffer.write(length, code)
-                b += length
+            # Write DC coefficient
+            dcMagnitude = compressBuffer[compressCursor]
+            (magCode, magLength) = dcEncoder.getCode(dcMagnitude)
+            bitBuffer.write(magLength, magCode)
 
-            cursor += 2
-            a += 56
+            compressedSize += magLength
+            compressCursor += 1
 
-            #Huffman-compress AC coefficients
+            if dcMagnitude != 0:
+
+                bitBuffer.write(dcMagnitude, readShort(compressBuffer[compressCursor:]))
+
+                compressedSize += dcMagnitude
+                compressCursor += 2
+
+            # Huffman-compress AC coefficients
             acIndex = 1
             totalCoeffs = blockWidth * blockHeight
 
             while acIndex < totalCoeffs:
 
-                v = substream[cursor]
+                v = compressBuffer[compressCursor]
 
                 (code, length) = acEncoder.getCode(v)
                 bitBuffer.write(length, code)
-                a += 8
-                b += length
-                cursor += 1
 
-                #Extended sequence
+                compressedSize += length
+                compressCursor += 1
+
+                # Extended sequence
                 if v & 0x80:
 
-                    (codeExt, lengthExt) = acEncoder.getCode(substream[cursor])
-                    bitBuffer.write(lengthExt, codeExt)
-                    a += 8
-                    b += lengthExt
-                    cursor += 1
+                    (extCode, extLength) = acEncoder.getCode(compressBuffer[compressCursor])
+                    bitBuffer.write(extLength, extCode)
 
-                #EOB
+                    compressedSize += extLength
+                    compressCursor += 1
+
+                # EOB
                 elif v == 0x4F:
                     break
 
                 acIndex += (v & 0xF) + 1
 
-        bitstream[component] = bitBuffer.getBuffer()
-        print("Raw: {}, Huffman: {}".format(a, b))
+        compressedSize = (compressedSize + 7) // 8
+        compressedSize += huffmanSize
+        uncompressedSize += huffmanSize
+
+        print("Frame: {}, Full: {}, Squeezed: {}, Compressed: {}, Temporal Ratio: {}, Compression Ratio: {}".format(frameID, header.framePixels, uncompressedSize, compressedSize, uncompressedSize / compressedSize, header.framePixels / compressedSize))
+
+    bitstream = bitBuffer.getBuffer()
+
+    originalSize = header.totalPixels
+    encodedSize = bitstream.size
+
+    print("Compressed {} frames".format(header.frameCount))
+    print("Full size: {}, Compressed: {}, Compression Ratio: {}".format(originalSize, encodedSize, originalSize / encodedSize))
 
     return bitstream

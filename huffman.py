@@ -1,12 +1,15 @@
-#Implements huffman coding
+import numpy as np
 
+from bitbuffer import BitBuffer
+
+
+
+# Canonical Huffman coder
 class HuffmanEncoder:
 
-    probabilityTable = {}
-    symbolTable = {}
-
-    def clearTokens(self):
-        self.probabilityTable.clear()
+    def __init__(self):
+        self.probabilityTable = {}
+        self.symbolTable = {}
 
 
     def recordToken(self, token):
@@ -42,35 +45,75 @@ class HuffmanEncoder:
 
         self.symbolTable = {}
 
-        code = 0
         codeLength = 1
 
-        self.calculateCode(symbolList[0][1], code, codeLength)
+        symbolRoot = symbolList[0][1]
 
-        self.symbolTable = dict(sorted(self.symbolTable.items(), key = lambda v: v[1][1]))
+        if isinstance(symbolRoot, tuple):
 
-        #for symbol, (code, length) in self.symbolTable:
-        #    print("{}: L = {}, {:b}".format(symbol, length, code))
+            treeTable = []
+            self.convertTree(1, symbolRoot, treeTable)
+            treeTable.sort()
+
+            code = 0
+            prevLength = 1
+
+            for (length, symbol) in treeTable:
+
+                if length != prevLength:
+                    code <<= length - prevLength
+                    prevLength = length
+
+                self.symbolTable[symbol] = (code, length)
+                code += 1
+
+        else:
+
+            self.symbolTable[symbolRoot] = (0, 1)
 
 
-    def calculateCode(self, symlist, code, length):
+    def convertTree(self, length, symlist, treeTable):
 
         left = symlist[0]
         right = symlist[1]
 
-        if left == 80:
-            True
-
         if isinstance(left, tuple):
-            self.calculateCode(left, code << 1, length + 1)
+            self.convertTree(length + 1, left, treeTable)
         else:
-            self.symbolTable[left] = (code << 1, length)
+            treeTable.append((length, left))
 
         if isinstance(right, tuple):
-            self.calculateCode(right, (code << 1) + 1, length + 1)
+            self.convertTree(length + 1, right, treeTable)
         else:
-            self.symbolTable[right] = ((code << 1) + 1, length)
+            treeTable.append((length, right))
+
 
 
     def getCode(self, symbol):
         return self.symbolTable[symbol]
+
+
+    def serialize(self, bitBuffer: BitBuffer):
+
+        highestLength = next(reversed(self.symbolTable.values()))[1]
+        lengths = np.zeros(highestLength, dtype = np.uint8)
+
+        for symbol, (code, length) in self.symbolTable.items():
+            lengths[length - 1] += 1
+
+        bitBuffer.write(8, highestLength)
+        
+        for i in range(lengths.size):
+            bitBuffer.write(8, lengths[i])
+
+        for symbol, (code, length) in self.symbolTable.items():
+            bitBuffer.write(8, symbol)
+            
+
+
+
+
+
+class HuffmanDecoder:
+
+    pass
