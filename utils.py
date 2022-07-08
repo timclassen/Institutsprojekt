@@ -26,3 +26,15 @@ def readShort(stream):
 
 def readInt(stream):
     return stream[0] | (stream[1] << 8) | (stream[2] << 16) | (stream[3] << 24)
+
+
+def reverse(x, size):
+
+    y = 0
+
+    for i in range(size):
+        y <<= 1
+        y |= x & 0x1
+        x >>= 1
+
+    return y

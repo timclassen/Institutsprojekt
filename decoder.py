@@ -1,7 +1,10 @@
 # TODO: Put your implementation of the encoder here
 import numpy as np
 from scipy.fftpack import idct
+from bitbuffer import BitReader
+from huffman import HuffmanDecoder
 import quantization as quant
+from utils import DCPredictor
 import zigzag as zz
 from header import Header
 
@@ -9,11 +12,20 @@ from header import Header
 
 def decoder(bitstream):
 
-    header = readStreamHeader(bitstream)
-    dezigzagBlocks = entropyDecompress(bitstream, header)
-    quantizedBlocks = dequantization(dezigzagBlocks)
+    print("Decoding")
+
+    (header, blocks) = entropyDecompress(bitstream)
+    print("Decompressed")
+
+    quantizedBlocks = dequantization(blocks)
+    print("Dequantized data")
+
     idctBlocks = applyIDCT(quantizedBlocks)
+    print("Applied IDCT")
+
     result = reassembleFromBlocks(idctBlocks, header)
+    print("Reassembled image")
+
     return result
 
 
@@ -62,36 +74,34 @@ def dequantization(blocks):
     return blocks
 
 
-    
-def inplaceDecompress(dcPred, stream, block, zigzag):
-    '''
-        The first element is the DC component, the rest is AC
-        For DC, do a prediction-based scheme
-        For AC, compress data as follows:
-        ESXXZZZZ [XXXXXXXX]
-        E: Extended sequence
-        S: Sign bit
-        X: Difference in 2s complement
-        Z: Zero run length
-        EOB is encoded as 01001111 == 0x4F
-    '''
-    dcDelta = readShort(stream)
-    dc = dcDelta + dcPred
-    dcPred = dc
+def inplaceDecompress(block, bitReader, dcPred, dcDecoder, acDecoder, dezigzag):
+
+    coeffBaseDifference = [0, -1, -3, -7, -15, -31, -63, -127, -255, -511, -1023, -2047, -4095, -8191, -16383, -32767]
+    entropyPositiveBase = [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
+
+    dcDelta = 0
+    dcMagnitude = dcDecoder.read(bitReader)
+
+    if dcMagnitude != 0:
+
+        dcOffset = bitReader.read(dcMagnitude)
+        dcDelta = dcOffset if dcOffset >= entropyPositiveBase[dcMagnitude] else coeffBaseDifference[dcMagnitude] + dcOffset
+
+    dc = dcDelta + dcPred.prediction
+    dcPred.prediction = dc
+
     block[0] = dc
 
     acIndex = 1
-    cursor = 2
     totalCoeffs = len(block)
 
     while acIndex < totalCoeffs:
 
-        value = readByte(stream[cursor:])
-        cursor += 1
+        value = acDecoder.read(bitReader)
 
         #Check if we had EOB
         if value == 0x4F:
-            return cursor
+            return
 
         zeroes = value & 0xF
         sign = value & 0x40
@@ -99,8 +109,7 @@ def inplaceDecompress(dcPred, stream, block, zigzag):
         #Check whether we have an extended sequence
         if value & 0x80:
 
-            extValue = readByte(stream[cursor:])
-            cursor += 1
+            extValue = acDecoder.read(bitReader)
             value = extValue | (((value >> 4) & 0x3) << 8)
 
         #If not, extend value to 8 bits
@@ -112,82 +121,107 @@ def inplaceDecompress(dcPred, stream, block, zigzag):
         if sign:
             value = -value
 
-        block[zigzag[acIndex]] = value
+        block[dezigzag[acIndex]] = value
         acIndex += zeroes + 1
 
-    return cursor
 
 
+def readStreamHeader(bitReader: BitReader):
 
+    s = bitReader.read(8)
+    v = bitReader.read(8)
+    c = bitReader.read(8)
+    version = bitReader.read(8)
 
-def readStreamHeader(bitstream):
+    if s != ord('S') or v != ord('V') or c != ord('C') or version != 0:
+        raise RuntimeError("Bad SVC file")
 
-    '''
-        The header has the following layout:
-        1) Luma Width
-        2) Luma Height
-        3) Chroma Width
-        4) Chroma Height
-        5) Frame Count
-    '''
-    headerStream = bitstream["H"]
+    lumaSizeW = bitReader.read(32)
+    lumaSizeH = bitReader.read(32)
+    chromaSizeW = bitReader.read(32)
+    chromaSizeH = bitReader.read(32)
+    frameCount = bitReader.read(32)
 
-    header = Header()
-    header.lumaSize = (readInt(headerStream), readInt(headerStream[0x4:]))
-    header.chromaSize = (readInt(headerStream[0x8:]), readInt(headerStream[0xC:]))
-    header.frameCount = readInt(headerStream[0x10:])
-
-    header.lumaPixels = header.lumaSize[0] * header.lumaSize[1]
-    header.chromaPixels = header.chromaSize[0] * header.chromaSize[1]
+    header = Header((lumaSizeW, lumaSizeH), (chromaSizeW, chromaSizeH), frameCount)
 
     return header
 
 
 
-def entropyDecompress(bitstream, header):
+def entropyDecompress(bitstream):
 
-    blocks = {"Y": {}, "U": {}, "V": {}}
+    bitReader = BitReader(bitstream)
+    header = readStreamHeader(bitReader)
+
+    blocks = { "Y": {}, "U": {}, "V": {}}
     dezigzagTransforms = {}
 
-    for component in ["Y", "U", "V"]:
+    # For simplicity reasons, we assume blocks are in descending order towards the border
+    blockLumaEndX = (header.lumaSize[0] // 8) * 8
+    blockLumaEndY = (header.lumaSize[1] // 8) * 8
+    blockChromaEndX = (header.chromaSize[0] // 4) * 4
+    blockChromaEndY = (header.chromaSize[1] // 4) * 4
+    
+    for frameID in range(header.frameCount):
 
-        subsampled = component == "V" or component == "U"
-        baseBlockDim = 4 if subsampled else 8
-        dcPrediction = 0
-        cursor = 0
-        substream = bitstream[component]
+        biDecoder = HuffmanDecoder()
+        dcDecoder = HuffmanDecoder()
+        acDecoder = HuffmanDecoder()
 
-        frameID = 0
+        bitReader.align()
+        biDecoder.deserialize(bitReader)
+        dcDecoder.deserialize(bitReader)
+        acDecoder.deserialize(bitReader)
 
-        while cursor < len(bitstream[component]):
+        for component in ["Y", "U", "V"]:
 
-            #Read block information
-            sizeCompressed = readByte(substream[cursor:])
-            x = readShort(substream[cursor + 1:])
-            y = readShort(substream[cursor + 3:])
+            luma = component == "Y"
+            baseBlockDim = 8 if luma else 4
 
-            cursor += 5
+            dcPrediction = DCPredictor()
 
-            blockWidth = (baseBlockDim << (sizeCompressed & 0x3)).astype("int32")
-            blockHeight = (baseBlockDim << ((sizeCompressed >> 2) & 0x3)).astype("int32")
-            newFrame = sizeCompressed & 0x80
+            blockEndX = blockLumaEndX if luma else blockChromaEndX
+            blockEndY = blockLumaEndY if luma else blockChromaEndY
+            blockPosition = (0, 0)
 
-            if newFrame:
-                frameID += 1
+            while True:
 
-            blockKey = (frameID, x, y)
-            blockSize = (blockWidth, blockHeight)
+                # Read block information
+                sizeCompressed = biDecoder.read(bitReader)
 
-            totalPixels = blockWidth * blockHeight
+                blockWidth = (baseBlockDim << (sizeCompressed & 0x3)).astype("int32")
+                blockHeight = (baseBlockDim << ((sizeCompressed >> 2) & 0x3)).astype("int32")
+                newFrame = sizeCompressed & 0x80
 
-            if blockSize not in dezigzagTransforms:
-                dezigzagTransforms[blockSize] = zz.dezigzagTransform(blockSize)
+                # Setup block information
+                blockKey = (frameID, blockPosition[0], blockPosition[1])
+                blockSize = (blockWidth, blockHeight)
 
-            buffer = np.zeros(totalPixels, dtype=np.float64)
+                totalPixels = blockWidth * blockHeight
 
-            compressedSize = inplaceDecompress(dcPrediction, substream[cursor:], buffer, dezigzagTransforms[blockSize])
-            cursor += compressedSize
+                # Create dezigzag transform
+                if blockSize not in dezigzagTransforms:
+                    dezigzagTransforms[blockSize] = zz.zigzagTransform(blockSize)
 
-            blocks[component][blockKey] = np.reshape(buffer, (blockWidth, blockHeight))
+                # Create block buffer
+                block = np.zeros(totalPixels, dtype = np.float64)
 
-    return blocks
+                # Decompress
+                inplaceDecompress(block, bitReader, dcPrediction, dcDecoder, acDecoder, dezigzagTransforms[blockSize])
+
+                # Add block to tree
+                blocks[component][blockKey] = np.reshape(block, (blockWidth, blockHeight))
+
+                # Set new block position
+                blockPosition = (blockPosition[0] + blockWidth, blockPosition[1])
+
+                # Jump to next block line
+                if blockPosition[0] >= blockEndX:
+                    blockPosition = (0, blockPosition[1] + blockHeight)
+
+                if blockPosition[1] == blockEndY:
+                    break
+
+        print("Decoded frame {}".format(frameID))
+
+    return (header, blocks)

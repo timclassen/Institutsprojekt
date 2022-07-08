@@ -1,10 +1,12 @@
+from configparser import ExtendedInterpolation
 import numpy as np
 
-from bitbuffer import BitBuffer
+from bitbuffer import BitBuffer, BitReader
+from utils import reverse
 
 
 
-# Canonical Huffman coder
+# Canonical Huffman Encoder
 class HuffmanEncoder:
 
     def __init__(self):
@@ -64,7 +66,7 @@ class HuffmanEncoder:
                     code <<= length - prevLength
                     prevLength = length
 
-                self.symbolTable[symbol] = (code, length)
+                self.symbolTable[symbol] = (reverse(code, length), length)
                 code += 1
 
         else:
@@ -113,7 +115,98 @@ class HuffmanEncoder:
 
 
 
-
+# Fast Huffman Decoder
 class HuffmanDecoder:
 
-    pass
+    
+    def __init__(self):
+        self.fastHuffmanTable = np.full(256, (0, 0xFF), dtype = (np.uint8, 2))
+        self.extHuffmanTables = []
+        self.maxExtLength = 0
+
+
+    def deserialize(self, bitReader: BitReader):
+
+        highestLength = bitReader.read(8)
+
+        lengths = []
+
+        for i in range(highestLength):
+            lengths.append(bitReader.read(8))
+
+        code = 0
+        extGenerated = False
+        self.maxExtLength = highestLength - 8
+
+        '''
+            Fast huffman tables, algorithm based off Arclight's JPEGDecoder
+            The idea is breaking up a tree that has a O(log n) huffman code retrieval cost into a O(1) operation.
+            We cut the tree after 8 levels and fill the fast table with all the codes derived from a given
+            8-bit value. Each entry consists of a tuple (symbol, length).
+        '''
+
+        for length in range(highestLength):
+
+            code <<= 1
+            count = lengths[length]
+            realLength = length + 1
+
+            for i in range(count):
+
+                symbol = bitReader.read(8)
+
+                revCode = reverse(code, realLength)
+
+                if length < 8:
+
+                    endCode = 1 << (7 - length)
+
+                    for j in range(endCode):
+                        self.fastHuffmanTable[(j << realLength) + revCode] = (symbol, realLength)
+
+                else:
+
+                    if not extGenerated:
+
+                        for j in range(256):
+
+                            if self.fastHuffmanTable[j][1] == 0xFF:
+                                
+                                extIndex = len(self.extHuffmanTables)
+                                self.fastHuffmanTable[j] = (extIndex, 0xFF)
+                                self.extHuffmanTables.append(np.empty(2 << self.maxExtLength, dtype = (np.uint8, 2)))
+
+                        extGenerated = True
+
+                    fastPrefix = revCode & 0xFF
+                    extCode = revCode >> 8
+
+                    extLength = length - 7
+                    endCode = 1 << (self.maxExtLength - extLength)
+
+                    extTableID = self.fastHuffmanTable[fastPrefix][0]
+
+                    for j in range(endCode):
+                        self.extHuffmanTables[extTableID][(j << extLength) + extCode] = (symbol, realLength)
+
+                code += 1
+
+
+    def read(self, bitReader: BitReader):
+
+        result = bitReader.peek(8)
+        (symbol, length) = self.fastHuffmanTable[result]
+
+        if length == 0xFF:
+
+            bitReader.consume(8)
+            result = bitReader.peek(self.maxExtLength)
+            (symbol, length) = self.extHuffmanTables[symbol][result]
+
+            bitReader.consume(length - 8)
+
+        else:
+
+            bitReader.consume(length)
+
+        return symbol

@@ -2,47 +2,49 @@
 from yuv_io import read_yuv_video, write_yuv_video
 from encoder import encoder
 from decoder import decoder
-from header import Header
-from bitstream_io import write_bitstream, read_bitstream
+from bitstream_io import writeBitstream, readBitstream
 from psnr import psnr_yuv
 import os
 
 
-def encode_and_decode_video(yuv_video_path):
+def sliceVideo(video, start, frames):
 
-    original_video = read_yuv_video(yuv_video_path)
-    
-    original_video = {
-        "Y": original_video["Y"][:2],
-        "U": original_video["U"][:2],
-        "V": original_video["V"][:2]
+    video = {
+        "Y": video["Y"][start:start + frames],
+        "U": video["U"][start:start + frames],
+        "V": video["V"][start:start + frames]
     }
-    
-    
+
+
+def encode_and_decode_video(yuvVideoPath):
+
+    svcPath = "tmp/video.svc"
     decodedOutPath = "tmp/decodedVid.yuv"
 
+    originalVideo = read_yuv_video(yuvVideoPath, bit_depth = 8)
 
-    header = Header((original_video["Y"].shape[1], original_video["Y"].shape[2]), (original_video["U"].shape[1], original_video["U"].shape[2]), original_video["Y"].shape[0])
-    print("Original size: {}".format(header.totalPixels))
+    # sliceVideo(originalVideo, 0, 2)
 
-    bitstream = encoder(original_video, header)
+    bitstream = encoder(originalVideo, (64, 64))
     bitstreamSize = bitstream.size
-
     print("Encoded")
-    print("Compressed size: {}".format(bitstreamSize))
 
-    decoded_video = decoder(bitstream)
+    writeBitstream(svcPath, bitstream)
+    print("Written to file " + svcPath)
+
+    bitstream = readBitstream(svcPath)
+    decodedVideo = decoder(bitstream)
     print("Decoded")
 
-    write_yuv_video(decoded_video, decodedOutPath)
+    write_yuv_video(decodedVideo, decodedOutPath)
     print("Written to file " + decodedOutPath)
+    
+    originalVideoSize = os.path.getsize(yuvVideoPath)
 
-    original_video_size = os.path.getsize(yuv_video_path)
-
-    print("Size of original video:", original_video_size)
+    print("Size of original video:", originalVideoSize)
     print("Size of bitstream:", bitstreamSize)
-    print("Compression ratio:", original_video_size / bitstreamSize)
-    print("PSNR:", psnr_yuv(original_video, decoded_video))
+    print("Compression ratio:", originalVideoSize / bitstreamSize)
+    print("PSNR:", psnr_yuv(originalVideo, decodedVideo))
 
 
-encode_and_decode_video("data/ArenaOfValor_384x384_60_8bit_420.yuv")
+encode_and_decode_video("data/BlowingBubbles_384x240_50.yuv")

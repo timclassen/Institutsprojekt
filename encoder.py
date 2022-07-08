@@ -5,6 +5,7 @@ from venv import create
 import numpy as np
 from bitbuffer import BitBuffer
 from scipy.fftpack import dct
+from header import Header
 from huffman import HuffmanEncoder
 import quantization as quant
 from utils import *
@@ -12,43 +13,80 @@ import zigzag as zz
 
 
 
-def encoder(video, header):
+def encoder(video, baseBlockSize):
+
     '''
         Encodes the video and returns a bitstream
     '''
-    blockData = divideInBlocks(video, (16, 16))
+
+    print("Encoding")
+
+    header = Header((video["Y"].shape[1], video["Y"].shape[2]), (video["U"].shape[1], video["U"].shape[2]), video["Y"].shape[0])
+
+    blockData = divideInBlocks(header, video, baseBlockSize)
+    print("Subdivided frame into {} x {} blocks".format(baseBlockSize[0], baseBlockSize[1]))
+
     dctBlocks = applyDCT(blockData)
+    print("Applied DCT")
+
     quantizedBlocks = quantization(dctBlocks)
+    print("Quantized data")
+
     bitstream = entropyCompress(quantizedBlocks, header)
+    print("Compressed")
+
     return bitstream
 
 
-def divideInBlocks(vid, blockSize=(64, 64)):
+def divideInBlocks(header, video, blockSize = (64, 64)):
 
-    newDict = {}
     blockSizes = {
         "Y": blockSize,
-        "U": (blockSize[0] // (vid["Y"].shape[1] // vid["U"].shape[1]), blockSize[1] // (vid["Y"].shape[2] // vid["U"].shape[2])),
-        "V": (blockSize[0] // (vid["Y"].shape[1] // vid["V"].shape[1]), blockSize[1] // (vid["Y"].shape[2] // vid["V"].shape[2]))
+        "U": (blockSize[0] // (video["Y"].shape[1] // video["U"].shape[1]), blockSize[1] // (video["Y"].shape[2] // video["U"].shape[2])),
+        "V": (blockSize[0] // (video["Y"].shape[1] // video["V"].shape[1]), blockSize[1] // (video["Y"].shape[2] // video["V"].shape[2]))
     }
 
-    for component in vid:
+    blocks = { "Y": {}, "U": {}, "V": {}}
 
+    for component, frames in video.items():
+
+        luma = component == "Y"
+        frameSize = header.lumaSize if luma else header.chromaSize
+        minBlockSize = 8 if luma else 4
+
+        width = frames[0].shape[0]
+        height = frames[0].shape[1]
         compBlockSize = blockSizes[component]
 
-        newDict[component] = {}
-        frameCount = vid[component].shape[0]
-        height = vid[component][0].shape[1]
-        width = vid[component][0].shape[0]
         blocksInX = (width + compBlockSize[0] - 1) // compBlockSize[0]
         blocksInY = (height + compBlockSize[1] - 1) // compBlockSize[1]
 
-        for frame in range(0, vid[component].shape[0]):
-            for x in range(0, vid[component].shape[1], compBlockSize[0]):
-                for y in range(0, vid[component].shape[2], compBlockSize[1]):
-                    newDict[component][(frame, x, y)] = vid[component][frame, x:x + compBlockSize[0], y:y + compBlockSize[1]].astype('float64')
+        for frame in range(header.frameCount):
 
-    return newDict
+            y = 0
+
+            while y < frameSize[1]:
+
+                x = 0
+                blockHeight = compBlockSize[1]
+
+                while y + blockHeight > frameSize[1] and blockHeight != minBlockSize:
+                    blockHeight >>= 1
+
+                while x < frameSize[0]:
+
+                    blockWidth = compBlockSize[0]
+
+                    while x + blockWidth > frameSize[0] and blockWidth != minBlockSize:
+                        blockWidth >>= 1
+
+                    blocks[component][(frame, x, y)] = frames[frame, x:x + blockWidth, y:y + blockHeight].astype('float64')
+
+                    x += blockWidth
+
+                y += blockHeight
+
+    return blocks
 
 
 def applyDCT(blocks):
@@ -82,6 +120,7 @@ def quantization(blocks):
 
 
 def inplaceCompress(block, stream, dcPred, dcEncoder, acEncoder):
+    
     '''
         The first element is the DC component, the rest is AC
         For DC, do a prediction-based scheme
@@ -205,12 +244,18 @@ def writeStreamHeader(header, bitBuffer: BitBuffer):
 
     '''
         The header has the following layout:
-        1) Luma Width
-        2) Luma Height
-        3) Chroma Width
-        4) Chroma Height
-        5) Frame Count
+        char[3]: "SVC"
+        u8:  Version
+        u32: Luma Width
+        u32: Luma Height
+        u32: Chroma Width
+        u32: Chroma Height
+        u32: Frame Count
     '''
+    bitBuffer.write(8, ord('S'))
+    bitBuffer.write(8, ord('V'))
+    bitBuffer.write(8, ord('C'))
+    bitBuffer.write(8, 0x00)
     bitBuffer.write(32, header.lumaSize[0])
     bitBuffer.write(32, header.lumaSize[1])
     bitBuffer.write(32, header.chromaSize[0])
@@ -223,14 +268,8 @@ def writeStreamHeader(header, bitBuffer: BitBuffer):
 
 def entropyCompress(blocks, header):
 
-    '''
-        We have to take metadata into account, such as:
-        - Block configuration as compressed pair <u8, u8> [2 bytes]
-
-        For our bitstream size, expect the worst by having zero compression
-    '''
-
-    compressBufferSize = header.lumaPixels + header.lumaPixels // 32 + (header.chromaPixels + header.chromaPixels // 8) * 2
+    # Estimate the maximum size that can ever be used for a single block
+    compressBufferSize = (header.lumaPixels + header.chromaPixels * 2) * 4
     compressBuffer = np.empty(compressBufferSize, dtype = np.uint8)
 
     zigzagTransforms = {}
@@ -278,7 +317,7 @@ def entropyCompress(blocks, header):
             baseBlockShift = 4 if luma else 3
 
 
-            for blockPos, block in sorted(blockArrays[component][frameID].items()):
+            for blockPos, block in sorted(blockArrays[component][frameID].items(), key = lambda x : x[0][1]):
 
                 blockSize = block.shape
                 pixelCount = blockSize[0] * blockSize[1]
@@ -405,7 +444,7 @@ def entropyCompress(blocks, header):
 
         print("Frame: {}, Full: {}, Squeezed: {}, Compressed: {}, Temporal Ratio: {}, Compression Ratio: {}".format(frameID, header.framePixels, uncompressedSize, compressedSize, uncompressedSize / compressedSize, header.framePixels / compressedSize))
 
-    bitstream = bitBuffer.getBuffer()
+    bitstream = bitBuffer.toBuffer()
 
     originalSize = header.totalPixels
     encodedSize = bitstream.size

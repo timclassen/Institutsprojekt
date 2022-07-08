@@ -1,10 +1,12 @@
-# TODO: Put your implementation for writing and reading bitstream files here
 from yuv_io import read_yuv_video, write_yuv_video
+import numpy as np
 
 
-def read_bitstream(file_path):
-    return read_yuv_video(file_path)
+def readBitstream(filePath):
+    return np.fromfile(filePath, dtype = np.uint8)
 
 
-def write_bitstream(file_path, bitstream):
-    return write_yuv_video(bitstream, file_path)
+def writeBitstream(filePath, bitstream):
+
+    with open(filePath, "wb") as file:
+        file.write(bitstream)
