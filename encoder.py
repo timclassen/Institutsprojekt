@@ -21,9 +21,12 @@ def encoder(video, baseBlockSize):
 
     print("Encoding")
 
-    header = Header((video["Y"].shape[1], video["Y"].shape[2]), (video["U"].shape[1], video["U"].shape[2]), video["Y"].shape[0])
+    header = Header((video["Y"].shape[2], video["Y"].shape[1]), (video["U"].shape[2], video["U"].shape[1]), video["Y"].shape[0], 4)
 
-    blockData = divideInBlocks(header, video, baseBlockSize)
+    (iFrames, pFrames) = splitFrames(video, header.gopSize)
+
+    
+    blockData = divideInBlocks(header, iFrames, baseBlockSize)
     print("Subdivided frame into {} x {} blocks".format(baseBlockSize[0], baseBlockSize[1]))
 
     dctBlocks = applyDCT(blockData)
@@ -38,49 +41,76 @@ def encoder(video, baseBlockSize):
     return bitstream
 
 
+
+def splitFrames(video, gopSize):
+
+    frameCount = video["Y"].shape[0]
+    iFrameCount = (frameCount + (gopSize - 1)) // gopSize
+    pFrameCount = frameCount - iFrameCount
+    
+    iFrames = {}
+    pFrames = {}
+
+    for component, frames in video.items():
+
+        for i in range(iFrameCount):
+            frames[[i, i * gopSize]] = frames[[i * gopSize, i]]
+
+        iFrames[component] = frames[:iFrameCount]
+        pFrames[component] = np.sort(frames[iFrameCount:pFrameCount], axis = 0)
+
+    return iFrames, pFrames
+
+
+
 def divideInBlocks(header, video, blockSize = (64, 64)):
+
+    subsamplingFactor = (header.lumaSize[0] // header.chromaSize[1], header.lumaSize[1] // header.chromaSize[1])
 
     blockSizes = {
         "Y": blockSize,
-        "U": (blockSize[0] // (video["Y"].shape[1] // video["U"].shape[1]), blockSize[1] // (video["Y"].shape[2] // video["U"].shape[2])),
-        "V": (blockSize[0] // (video["Y"].shape[1] // video["V"].shape[1]), blockSize[1] // (video["Y"].shape[2] // video["V"].shape[2]))
+        "U": (blockSize[0] // subsamplingFactor[0], blockSize[1] // subsamplingFactor[1]),
+        "V": (blockSize[0] // subsamplingFactor[0], blockSize[1] // subsamplingFactor[1])
     }
 
     blocks = { "Y": {}, "U": {}, "V": {}}
+    frameCount = video["Y"].shape[0]
 
     for component, frames in video.items():
 
         luma = component == "Y"
-        frameSize = header.lumaSize if luma else header.chromaSize
         minBlockSize = 8 if luma else 4
 
-        width = frames[0].shape[0]
-        height = frames[0].shape[1]
-        compBlockSize = blockSizes[component]
+        frameSize = header.lumaSize if luma else header.chromaSize
+        width = (frameSize[0] + (minBlockSize - 1)) // minBlockSize * minBlockSize
+        height = (frameSize[1] + (minBlockSize - 1)) // minBlockSize * minBlockSize
 
-        blocksInX = (width + compBlockSize[0] - 1) // compBlockSize[0]
-        blocksInY = (height + compBlockSize[1] - 1) // compBlockSize[1]
+        baseBlockSize = blockSizes[component]
 
-        for frame in range(header.frameCount):
+        for frame in range(frameCount):
 
             y = 0
 
-            while y < frameSize[1]:
+            while y < height:
 
                 x = 0
-                blockHeight = compBlockSize[1]
+                blockHeight = baseBlockSize[1]
 
-                while y + blockHeight > frameSize[1] and blockHeight != minBlockSize:
+                while y + blockHeight > height:
                     blockHeight >>= 1
 
-                while x < frameSize[0]:
+                while x < width:
 
-                    blockWidth = compBlockSize[0]
+                    blockWidth = baseBlockSize[0]
 
-                    while x + blockWidth > frameSize[0] and blockWidth != minBlockSize:
+                    while x + blockWidth > width:
                         blockWidth >>= 1
 
-                    blocks[component][(frame, x, y)] = frames[frame, x:x + blockWidth, y:y + blockHeight].astype('float64')
+                    slot = frames[frame, y:y + blockHeight, x:x + blockWidth]
+
+                    blockArray = np.zeros((blockHeight, blockWidth), dtype = np.float64)
+                    blockArray[:min(blockHeight, slot.shape[0]), :min(blockWidth, slot.shape[1])] = slot
+                    blocks[component][(frame, x, y)] = blockArray
 
                     x += blockWidth
 
@@ -256,6 +286,7 @@ def writeStreamHeader(header, bitBuffer: BitBuffer):
     bitBuffer.write(8, ord('V'))
     bitBuffer.write(8, ord('C'))
     bitBuffer.write(8, 0x00)
+    bitBuffer.write(8, header.gopSize)
     bitBuffer.write(32, header.lumaSize[0])
     bitBuffer.write(32, header.lumaSize[1])
     bitBuffer.write(32, header.chromaSize[0])
@@ -266,7 +297,7 @@ def writeStreamHeader(header, bitBuffer: BitBuffer):
 
 
 
-def entropyCompress(blocks, header):
+def entropyCompress(iBlocks, header):
 
     # Estimate the maximum size that can ever be used for a single block
     compressBufferSize = (header.lumaPixels + header.chromaPixels * 2) * 4
@@ -283,7 +314,7 @@ def entropyCompress(blocks, header):
     # Rearrange block tables to [component][frame][x, y] -> block data
     blockArrays = {}
 
-    for component, blockTable in blocks.items():
+    for component, blockTable in iBlocks.items():
 
         blockArrays[component] = {}
 
@@ -308,6 +339,9 @@ def entropyCompress(blocks, header):
         dcEncoder = HuffmanEncoder()
         acEncoder = HuffmanEncoder()
 
+        if frameID & (header.gopSize - 1):
+            continue
+
         # Squeeze
         for component in ["Y", "U", "V"]:
 
@@ -317,9 +351,9 @@ def entropyCompress(blocks, header):
             baseBlockShift = 4 if luma else 3
 
 
-            for blockPos, block in sorted(blockArrays[component][frameID].items(), key = lambda x : x[0][1]):
+            for blockPos, block in sorted(blockArrays[component][frameID / header.gopSize].items(), key = lambda x : x[0][1]):
 
-                blockSize = block.shape
+                blockSize = (block.shape[1], block.shape[0])
                 pixelCount = blockSize[0] * blockSize[1]
 
                 # Write block information

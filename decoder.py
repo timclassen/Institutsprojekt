@@ -1,4 +1,5 @@
 # TODO: Put your implementation of the encoder here
+from distutils.ccompiler import gen_lib_options
 import numpy as np
 from scipy.fftpack import idct
 from bitbuffer import BitReader
@@ -29,23 +30,26 @@ def decoder(bitstream):
     return result
 
 
-def reassembleFromBlocks(blockDict, header):
+def reassembleFromBlocks(blocks, header):
 
     video = {
-        "Y": np.ndarray((header.frameCount, header.lumaSize[0], header.lumaSize[1]), dtype="uint8"),
-        "U": np.ndarray((header.frameCount, header.chromaSize[0], header.chromaSize[1]), dtype="uint8"),
-        "V": np.ndarray((header.frameCount, header.chromaSize[0], header.chromaSize[1]), dtype="uint8")
+        "Y": np.ndarray((header.frameCount, header.lumaSize[1], header.lumaSize[0]), dtype="uint8"),
+        "U": np.ndarray((header.frameCount, header.chromaSize[1], header.chromaSize[0]), dtype="uint8"),
+        "V": np.ndarray((header.frameCount, header.chromaSize[1], header.chromaSize[0]), dtype="uint8")
     }
 
     for component in video:
 
-        for block, blockData in blockDict[component].items():
+        luma = component == "Y"
+        frameSize = header.lumaSize if luma else header.chromaSize
+
+        for block, blockData in blocks[component].items():
 
             frame = block[0]
             x = block[1]
             y = block[2]
 
-            video[component][frame, x:x+blockData.shape[0], y:y+blockData.shape[1]] = np.clip(np.round(blockData), 0, 255)
+            video[component][frame, y:y+blockData.shape[0], x:x+blockData.shape[1]] = np.clip(np.round(blockData[:min(blockData.shape[0], frameSize[1] - y), :min(blockData.shape[1], frameSize[0] - x)]), 0, 255)
 
     return video
 
@@ -136,13 +140,14 @@ def readStreamHeader(bitReader: BitReader):
     if s != ord('S') or v != ord('V') or c != ord('C') or version != 0:
         raise RuntimeError("Bad SVC file")
 
+    gopSize = bitReader.read(8)
     lumaSizeW = bitReader.read(32)
     lumaSizeH = bitReader.read(32)
     chromaSizeW = bitReader.read(32)
     chromaSizeH = bitReader.read(32)
     frameCount = bitReader.read(32)
 
-    header = Header((lumaSizeW, lumaSizeH), (chromaSizeW, chromaSizeH), frameCount)
+    header = Header((lumaSizeW, lumaSizeH), (chromaSizeW, chromaSizeH), frameCount, gopSize)
 
     return header
 
@@ -157,12 +162,15 @@ def entropyDecompress(bitstream):
     dezigzagTransforms = {}
 
     # For simplicity reasons, we assume blocks are in descending order towards the border
-    blockLumaEndX = (header.lumaSize[0] // 8) * 8
-    blockLumaEndY = (header.lumaSize[1] // 8) * 8
-    blockChromaEndX = (header.chromaSize[0] // 4) * 4
-    blockChromaEndY = (header.chromaSize[1] // 4) * 4
+    blockLumaEndX = ((header.lumaSize[0] + 7) // 8) * 8
+    blockLumaEndY = ((header.lumaSize[1] + 7) // 8) * 8
+    blockChromaEndX = ((header.chromaSize[0] + 3) // 4) * 4
+    blockChromaEndY = ((header.chromaSize[1] + 3) // 4) * 4
     
     for frameID in range(header.frameCount):
+
+        if frameID & (header.gopSize - 1):
+            continue
 
         biDecoder = HuffmanDecoder()
         dcDecoder = HuffmanDecoder()
@@ -210,7 +218,7 @@ def entropyDecompress(bitstream):
                 inplaceDecompress(block, bitReader, dcPrediction, dcDecoder, acDecoder, dezigzagTransforms[blockSize])
 
                 # Add block to tree
-                blocks[component][blockKey] = np.reshape(block, (blockWidth, blockHeight))
+                blocks[component][blockKey] = np.reshape(block, (blockHeight, blockWidth))
 
                 # Set new block position
                 blockPosition = (blockPosition[0] + blockWidth, blockPosition[1])
@@ -219,7 +227,7 @@ def entropyDecompress(bitstream):
                 if blockPosition[0] >= blockEndX:
                     blockPosition = (0, blockPosition[1] + blockHeight)
 
-                if blockPosition[1] == blockEndY:
+                if blockPosition[1] >= blockEndY:
                     break
 
         print("Decoded frame {}".format(frameID))

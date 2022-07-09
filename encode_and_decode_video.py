@@ -18,9 +18,9 @@ def sliceVideo(video, start, frames):
 
 def encode_and_decode_video(yuvVideoPath):
 
-    svcPath = "tmp/video.svc"
-    decodedOutPath = "tmp/decodedVid.yuv"
-
+    decodedVideoPath = "tmp/"  + yuvVideoPath.split("/")[1]
+    svcPath = decodedVideoPath.replace(".yuv", ".svc")
+    
     originalVideo = read_yuv_video(yuvVideoPath, bit_depth = 8)
 
     # sliceVideo(originalVideo, 0, 2)
@@ -31,13 +31,13 @@ def encode_and_decode_video(yuvVideoPath):
 
     writeBitstream(svcPath, bitstream)
     print("Written to file " + svcPath)
-
+    
     bitstream = readBitstream(svcPath)
     decodedVideo = decoder(bitstream)
     print("Decoded")
 
-    write_yuv_video(decodedVideo, decodedOutPath)
-    print("Written to file " + decodedOutPath)
+    write_yuv_video(decodedVideo, decodedVideoPath)
+    print("Written to file " + decodedVideoPath)
     
     originalVideoSize = os.path.getsize(yuvVideoPath)
 
@@ -47,4 +47,4 @@ def encode_and_decode_video(yuvVideoPath):
     print("PSNR:", psnr_yuv(originalVideo, decodedVideo))
 
 
-encode_and_decode_video("data/BlowingBubbles_384x240_50.yuv")
+encode_and_decode_video("data/ArenaOfValor_384x384_60_8bit_420.yuv")

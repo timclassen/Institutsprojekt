@@ -1,7 +1,7 @@
 #The video's metadata
 class Header:
 
-    def __init__(self, lumaSize, chromaSize, frames):
+    def __init__(self, lumaSize, chromaSize, frames, gopSize):
         self.lumaSize = lumaSize
         self.chromaSize = chromaSize
         self.frameCount = frames
@@ -9,3 +9,4 @@ class Header:
         self.chromaPixels = chromaSize[0] * chromaSize[1]
         self.framePixels = self.lumaPixels + 2 * self.chromaPixels
         self.totalPixels = self.framePixels * self.frameCount
+        self.gopSize = gopSize
