@@ -1,19 +1,19 @@
-# TODO: Put your implementation of the encoder here
-from base64 import encode
-from bz2 import compress
-from venv import create
+import sys
+from tabnanny import check
 import numpy as np
 from bitbuffer import BitBuffer
 from scipy.fftpack import dct
 from header import Header
 from huffman import HuffmanEncoder
+from pblock import PBlock
 import quantization as quant
 from utils import *
 import zigzag as zz
+import cv2 as cv
 
 
 
-def encoder(video, baseBlockSize):
+def encoder(video):
 
     '''
         Encodes the video and returns a bitstream
@@ -21,21 +21,16 @@ def encoder(video, baseBlockSize):
 
     print("Encoding")
 
-    header = Header((video["Y"].shape[2], video["Y"].shape[1]), (video["U"].shape[2], video["U"].shape[1]), video["Y"].shape[0], 4)
+    header = Header((video["Y"].shape[2], video["Y"].shape[1]), (video["U"].shape[2], video["U"].shape[1]), video["Y"].shape[0], (32, 32), 4, 4, 4)
 
     (iFrames, pFrames) = splitFrames(video, header.gopSize)
+    pBlocks = generatePBlocks(iFrames, pFrames, header)
+    print("Generated P-Blocks")
 
-    
-    blockData = divideInBlocks(header, iFrames, baseBlockSize)
-    print("Subdivided frame into {} x {} blocks".format(baseBlockSize[0], baseBlockSize[1]))
+    iBlocks = generateIBlocks(iFrames, header)
+    print("Generated I-Blocks")
 
-    dctBlocks = applyDCT(blockData)
-    print("Applied DCT")
-
-    quantizedBlocks = quantization(dctBlocks)
-    print("Quantized data")
-
-    bitstream = entropyCompress(quantizedBlocks, header)
+    bitstream = entropyCompress(iBlocks, pBlocks, header)
     print("Compressed")
 
     return bitstream
@@ -53,18 +48,127 @@ def splitFrames(video, gopSize):
 
     for component, frames in video.items():
 
-        for i in range(iFrameCount):
-            frames[[i, i * gopSize]] = frames[[i * gopSize, i]]
+        iFrames[component] = np.empty((iFrameCount, frames.shape[1], frames.shape[2]))
+        pFrames[component] = np.empty((pFrameCount, frames.shape[1], frames.shape[2]))
+        pIndex = 0
 
-        iFrames[component] = frames[:iFrameCount]
-        pFrames[component] = np.sort(frames[iFrameCount:pFrameCount], axis = 0)
+        for i in range(frameCount):
+            
+            if i & (gopSize - 1):
+                pFrames[component][pIndex] = frames[i]
+                pIndex += 1
+
+            else:
+                iFrames[component][i // gopSize] = frames[i]
 
     return iFrames, pFrames
 
 
 
-def divideInBlocks(header, video, blockSize = (64, 64)):
+def generatePBlocks(iFrames, pFrames, header):
 
+    pBlocks = {"Y": {}, "U": {}, "V": {}}
+
+    for component, frames in pFrames.items():
+
+        luma = component == "Y"
+        blockSize = pBlockSize(header.ctuSize, luma)
+        frameSize = header.lumaSize if luma else header.chromaSize
+
+        motionDistance = (header.pMotionMaxBlockOffset * blockSize[0], header.pMotionMaxBlockOffset * blockSize[1])
+
+        for i in range(len(frames)):
+            
+            refIFrameIndex = i // (header.gopSize - 1)
+            refIFrameID = refIFrameIndex * header.gopSize
+
+            frameID = i + refIFrameIndex + 1
+            refIFrame = iFrames[component][refIFrameIndex]
+
+            pBlocks[component][frameID] = []
+
+            for y in range(0, frameSize[1], blockSize[1]):
+
+                for x in range(0, frameSize[0], blockSize[0]):
+
+                    block = frames[i, y : y + blockSize[1], x : x + blockSize[0]].astype("float32")
+                    regionBase = (max(x - motionDistance[0], 0), max(y - motionDistance[1], 0))
+                    
+                    if checkPerfectMatch(block, refIFrame[y : y + blockSize[1], x : x + blockSize[0]].astype("float32")):
+
+                        # Do not code the block, perfect match
+                        pBlocks[component][frameID].append(PBlock((x, y), 3, None, (0, 0)))
+
+                    else:
+
+                        (found, motion, diffBlock) = findMotionBlock(block, (x, y), refIFrame[regionBase[1] : min(y + motionDistance[1], frameSize[1]), regionBase[0] : min(x + motionDistance[0], frameSize[0])].astype("float32"), regionBase)
+
+                        if found:
+
+                            diffBlock = np.round(dct(dct(diffBlock, axis = 0, norm = 'ortho'), axis = 1, norm = 'ortho') / quant.getQuantizationMatrix(diffBlock.shape))
+
+                            if not np.any(diffBlock):
+
+                                if motion != (0, 0):
+
+                                    # Only code motion vector
+                                    pBlocks[component][frameID].append(PBlock((x, y), 1, None, motion))
+
+                                else:
+
+                                    # Do not code the block
+                                    pBlocks[component][frameID].append(PBlock((x, y), 3, None, (0, 0)))
+
+                            else:
+
+                                # Code motion p block
+                                pBlocks[component][frameID].append(PBlock((x, y), 0, diffBlock, motion))
+
+                        else:
+
+                            # Code intra block
+                            pBlocks[component][frameID].append(PBlock((x, y), 2, np.round(dct(dct(block, axis = 0, norm = 'ortho'), axis = 1, norm = 'ortho') / quant.getQuantizationMatrix(block.shape)), (0, 0)))
+
+    return pBlocks
+
+
+
+def checkPerfectMatch(pBlock, refRegion):
+    return np.allclose(pBlock, refRegion)
+
+
+
+def findMotionBlock(pBlock, pBlockPos, refRegion, refRegionPos):
+    
+    result = cv.matchTemplate(refRegion, pBlock, cv.TM_CCOEFF_NORMED)
+    minValue, maxValue, minPos, maxPos = cv.minMaxLoc(result)
+
+    if maxValue >= 0.9:
+        
+        motionVector = (pBlockPos[0] - (refRegionPos[0] + maxPos[0]), pBlockPos[1] - (refRegionPos[1] + maxPos[1]))
+        refBlock = refRegion[maxPos[1] : maxPos[1] + pBlock.shape[0], maxPos[0] : maxPos[0] + pBlock.shape[1]]
+
+        return (True, motionVector, pBlock - refBlock)
+
+    else:
+
+        return (False, (0, 0), None)
+
+    
+
+
+def generateIBlocks(iFrames, header):
+
+    blockData = divideIntraBlocks(header, iFrames)
+
+    return applyDCTAndQuantize(blockData)
+
+
+
+
+def divideIntraBlocks(header, iFrames):
+
+    blockSize = header.ctuSize
     subsamplingFactor = (header.lumaSize[0] // header.chromaSize[1], header.lumaSize[1] // header.chromaSize[1])
 
     blockSizes = {
@@ -74,14 +178,14 @@ def divideInBlocks(header, video, blockSize = (64, 64)):
     }
 
     blocks = { "Y": {}, "U": {}, "V": {}}
-    frameCount = video["Y"].shape[0]
+    frameCount = iFrames["Y"].shape[0]
 
-    for component, frames in video.items():
+    for component, frames in iFrames.items():
 
         luma = component == "Y"
         minBlockSize = 8 if luma else 4
-
         frameSize = header.lumaSize if luma else header.chromaSize
+
         width = (frameSize[0] + (minBlockSize - 1)) // minBlockSize * minBlockSize
         height = (frameSize[1] + (minBlockSize - 1)) // minBlockSize * minBlockSize
 
@@ -119,33 +223,16 @@ def divideInBlocks(header, video, blockSize = (64, 64)):
     return blocks
 
 
-def applyDCT(blocks):
+def applyDCTAndQuantize(blocks):
 
     for component in ["Y", "U", "V"]:
 
         for block in blocks[component]:
-            blocks[component][block] = dct(dct(blocks[component][block], axis = 0, norm = 'ortho'), axis = 1, norm = 'ortho')
+            
+            dctBlock = dct(dct(blocks[component][block], axis = 0, norm = 'ortho'), axis = 1, norm = 'ortho')
+            blocks[component][block] = np.round(dctBlock / quant.getQuantizationMatrix(dctBlock.shape))
 
     return blocks
-
-
-def quantization(blocks):
-
-    quantizationMatrices = {}
-
-    for component in ["Y", "U", "V"]:
-
-        for key, block in blocks[component].items():
-
-            blockSize = block.shape
-
-            if blockSize not in quantizationMatrices:
-                quantizationMatrices[blockSize] = quant.getQuantizationMatrix(blockSize, quant.DefaultQuantizationFunction)
-
-            blocks[component][key] = np.round(block / quantizationMatrices[blockSize])
-
-    return blocks
-
 
 
 
@@ -286,24 +373,25 @@ def writeStreamHeader(header, bitBuffer: BitBuffer):
     bitBuffer.write(8, ord('V'))
     bitBuffer.write(8, ord('C'))
     bitBuffer.write(8, 0x00)
-    bitBuffer.write(8, header.gopSize)
     bitBuffer.write(32, header.lumaSize[0])
     bitBuffer.write(32, header.lumaSize[1])
     bitBuffer.write(32, header.chromaSize[0])
     bitBuffer.write(32, header.chromaSize[1])
     bitBuffer.write(32, header.frameCount)
+    bitBuffer.write(8, header.ctuSize[0])
+    bitBuffer.write(8, header.ctuSize[1])
+    bitBuffer.write(8, header.gopSize)
 
 
 
 
 
-def entropyCompress(iBlocks, header):
+def entropyCompress(iBlocks, pBlocks, header):
 
     # Estimate the maximum size that can ever be used for a single block
     compressBufferSize = (header.lumaPixels + header.chromaPixels * 2) * 4
     compressBuffer = np.empty(compressBufferSize, dtype = np.uint8)
 
-    zigzagTransforms = {}
     zigzagBuffer = np.empty(64 * 64, dtype = np.int16)
 
     # Create bit buffer and write the stream header
@@ -326,157 +414,210 @@ def entropyCompress(iBlocks, header):
             blockArrays[component][frame][(x, y)] = block
 
 
+    compressedSize = bitBuffer.size()
 
     # Loop over all frames
     for frameID in range(header.frameCount):
 
-        newFrame = True
-
         cursor = 0
+        compressCursor = 0
+
         lumaEnd = 0
 
-        biEncoder = HuffmanEncoder()
-        dcEncoder = HuffmanEncoder()
-        acEncoder = HuffmanEncoder()
+        uncompressedSize = 0
+        huffmanSize = 0
 
         if frameID & (header.gopSize - 1):
-            continue
+        
+            # P-Frame coding
+            mvEncoder = HuffmanEncoder()
+            dcEncoder = HuffmanEncoder()
+            acEncoder = HuffmanEncoder()
 
-        # Squeeze
-        for component in ["Y", "U", "V"]:
+            prevBlockPos = np.zeros(2)
 
-            dcPrediction = DCPredictor()
+            for component in ["Y", "U", "V"]:
 
-            luma = component == "Y"
-            baseBlockShift = 4 if luma else 3
+                dcPrediction = DCPredictor()
+                pFrameArray = pBlocks[component][frameID]
+
+                for pBlock in pFrameArray:
+
+                    blockPos = np.array(pBlock.position)
+
+                    type = pBlock.type
+
+                    compressBuffer[cursor] = type
+                    cursor += 1
+
+                    if type <= 1:
+
+                        motionVector = pBlock.motionVector
+
+                        compressBuffer[cursor] = motionVector[0]
+                        compressBuffer[cursor + 1] = motionVector[1]
+
+                        mvEncoder.recordToken(abs(motionVector[0]))
+                        mvEncoder.recordToken(abs(motionVector[1]))
+
+                        cursor += 2
+
+                    if (type & 1) == 0:
+
+                        block = pBlock.block
+                        blockSize = (block.shape[1], block.shape[0])
+                        pixelCount = blockSize[0] * blockSize[1]
+
+                        zigzag = zz.zigzag(blockSize)
+                        flatBlock = np.reshape(block, pixelCount)
+
+                        for i in range(pixelCount):
+                            zigzagBuffer[i] = flatBlock[zigzag[i]]
+
+                        cursor += inplaceCompress(zigzagBuffer[:pixelCount], compressBuffer[cursor:], dcPrediction, dcEncoder, acEncoder)
 
 
-            for blockPos, block in sorted(blockArrays[component][frameID / header.gopSize].items(), key = lambda x : x[0][1]):
+                if component == "Y":
+                    lumaEnd = cursor
 
-                blockSize = (block.shape[1], block.shape[0])
-                pixelCount = blockSize[0] * blockSize[1]
+            # Build huffman trees
+            mvEncoder.buildTree()
+            dcEncoder.buildTree()
+            acEncoder.buildTree()
 
-                # Write block information
-                compressedBlockInfo = (blockSize[0] >> baseBlockShift).bit_length() | ((blockSize[1] >> baseBlockShift).bit_length() << 2) | (newFrame << 7)
-                newFrame = False
+            # Write huffman tables
+            bitBuffer.flush()
+            huffmanStart = bitBuffer.size()
 
-                biEncoder.recordToken(compressedBlockInfo)
-                writeByte(compressedBlockInfo, compressBuffer[cursor:])
-                cursor += 1
+            mvEncoder.serialize(bitBuffer)
+            dcEncoder.serialize(bitBuffer)
+            acEncoder.serialize(bitBuffer)
 
-                # If block transform indices haven't been calculated yet
-                if blockSize not in zigzagTransforms:
+            huffmanEnd = bitBuffer.size()
+            huffmanSize = huffmanEnd - huffmanStart
 
-                    # Add transform array to known zigzag sequences
-                    zigzagTransforms[blockSize] = zz.zigzagTransform(blockSize)
+            uncompressedSize = huffmanSize + cursor
 
-                # Calculate zigzag transform
-                zigzag = zigzagTransforms[blockSize]
-                flatBlock = np.reshape(block, pixelCount)
-                zigzagIndex = 0
+            blockSize = pBlockSize(header.ctuSize, True)
+            pixelCount = blockSize[0] * blockSize[1]
 
-                for i in range(pixelCount):
-                    zigzagBuffer[i] = flatBlock[zigzag[i]]
+            # Compress
+            while compressCursor < cursor:
 
-                # Compress block
-                cursorAdvance = inplaceCompress(zigzagBuffer[:pixelCount], compressBuffer[cursor:], dcPrediction, dcEncoder, acEncoder)
-                cursor += cursorAdvance
+                if compressCursor >= lumaEnd:
+                    blockSize = pBlockSize(header.ctuSize, False)
+                    pixelCount = blockSize[0] * blockSize[1]
 
-            if component == "Y":
-                lumaEnd = cursor
-
-
-        # Build huffman trees
-        biEncoder.buildTree()
-        dcEncoder.buildTree()
-        acEncoder.buildTree()
-
-        # Write huffman tables
-        bitBuffer.flush()
-        huffmanStart = bitBuffer.size()
-
-        biEncoder.serialize(bitBuffer)
-        dcEncoder.serialize(bitBuffer)
-        acEncoder.serialize(bitBuffer)
-
-        bitBuffer.flush()
-        huffmanEnd = bitBuffer.size()
-        huffmanSize = huffmanEnd - huffmanStart
-
-        # Setup statistics
-        uncompressedSize = cursor
-        compressedSize = 0
-
-        # Compress
-        compressCursor = 0
-        baseBlockDim = 8
-
-        while compressCursor < cursor:
-
-            if compressCursor >= lumaEnd:
-                baseBlockDim = 4
-
-            sizeCompressed = compressBuffer[compressCursor]
-
-            blockWidth = (baseBlockDim << (sizeCompressed & 0x3)).astype("int32")
-            blockHeight = (baseBlockDim << ((sizeCompressed >> 2) & 0x3)).astype("int32")
-
-            # Write frame header
-            (frameCode, frameLength) = biEncoder.getCode(sizeCompressed)
-            bitBuffer.write(frameLength, frameCode)
-
-            compressedSize += frameLength
-            compressCursor += 1
-
-            # Write DC coefficient
-            dcMagnitude = compressBuffer[compressCursor]
-            (magCode, magLength) = dcEncoder.getCode(dcMagnitude)
-            bitBuffer.write(magLength, magCode)
-
-            compressedSize += magLength
-            compressCursor += 1
-
-            if dcMagnitude != 0:
-
-                bitBuffer.write(dcMagnitude, readShort(compressBuffer[compressCursor:]))
-
-                compressedSize += dcMagnitude
-                compressCursor += 2
-
-            # Huffman-compress AC coefficients
-            acIndex = 1
-            totalCoeffs = blockWidth * blockHeight
-
-            while acIndex < totalCoeffs:
-
-                v = compressBuffer[compressCursor]
-
-                (code, length) = acEncoder.getCode(v)
-                bitBuffer.write(length, code)
-
-                compressedSize += length
+                type = compressBuffer[compressCursor]
                 compressCursor += 1
+                
+                bitBuffer.write(2, type)
 
-                # Extended sequence
-                if v & 0x80:
+                if type <= 1:
 
-                    (extCode, extLength) = acEncoder.getCode(compressBuffer[compressCursor])
-                    bitBuffer.write(extLength, extCode)
+                    # Write motion vector
+                    for i in range(2):
 
-                    compressedSize += extLength
-                    compressCursor += 1
+                        motionDistance = compressBuffer[compressCursor].astype("int32")
 
-                # EOB
-                elif v == 0x4F:
-                    break
+                        if motionDistance >= 128:
+                            motionDistance -= 256
 
-                acIndex += (v & 0xF) + 1
+                        bitBuffer.write(1, motionDistance >= 0)
 
-        compressedSize = (compressedSize + 7) // 8
-        compressedSize += huffmanSize
-        uncompressedSize += huffmanSize
+                        (mvCode, mvLength) = mvEncoder.getCode(abs(motionDistance))
+                        bitBuffer.write(mvLength, mvCode)
 
-        print("Frame: {}, Full: {}, Squeezed: {}, Compressed: {}, Temporal Ratio: {}, Compression Ratio: {}".format(frameID, header.framePixels, uncompressedSize, compressedSize, uncompressedSize / compressedSize, header.framePixels / compressedSize))
+                        compressCursor += 1
+
+                if (type & 1) == 0:
+                    compressCursor += huffmanCompressBlock(dcEncoder, acEncoder, bitBuffer, compressBuffer[compressCursor:], pixelCount)
+
+        else:
+
+            # I-Frame coding
+            biEncoder = HuffmanEncoder()
+            dcEncoder = HuffmanEncoder()
+            acEncoder = HuffmanEncoder()
+
+            # Squeeze
+            for component in ["Y", "U", "V"]:
+
+                dcPrediction = DCPredictor()
+
+                luma = component == "Y"
+                baseBlockShift = 4 if luma else 3
+
+
+                for blockPos, block in sorted(blockArrays[component][frameID // header.gopSize].items(), key = lambda x : x[0][1]):
+
+                    blockSize = (block.shape[1], block.shape[0])
+                    pixelCount = blockSize[0] * blockSize[1]
+
+                    # Write block information
+                    compressedBlockInfo = (blockSize[0] >> baseBlockShift).bit_length() | ((blockSize[1] >> baseBlockShift).bit_length() << 2)
+                    newFrame = False
+
+                    biEncoder.recordToken(compressedBlockInfo)
+                    writeByte(compressedBlockInfo, compressBuffer[cursor:])
+                    cursor += 1
+
+                    # Calculate zigzag transform
+                    zigzag = zz.zigzag(blockSize)
+                    flatBlock = np.reshape(block, pixelCount)
+                    zigzagIndex = 0
+
+                    for i in range(pixelCount):
+                        zigzagBuffer[i] = flatBlock[zigzag[i]]
+
+                    # Compress block
+                    cursor += inplaceCompress(zigzagBuffer[:pixelCount], compressBuffer[cursor:], dcPrediction, dcEncoder, acEncoder)
+
+                if component == "Y":
+                    lumaEnd = cursor
+
+
+            # Build huffman trees
+            biEncoder.buildTree()
+            dcEncoder.buildTree()
+            acEncoder.buildTree()
+
+            # Write huffman tables
+            bitBuffer.flush()
+            huffmanStart = bitBuffer.size()
+
+            biEncoder.serialize(bitBuffer)
+            dcEncoder.serialize(bitBuffer)
+            acEncoder.serialize(bitBuffer)
+
+            huffmanEnd = bitBuffer.size()
+            huffmanSize = huffmanEnd - huffmanStart
+
+            uncompressedSize = huffmanSize + cursor
+            baseBlockDim = 8
+
+            # Compress
+            while compressCursor < cursor:
+
+                if compressCursor >= lumaEnd:
+                    baseBlockDim = 4
+
+                sizeCompressed = compressBuffer[compressCursor]
+
+                blockWidth = (baseBlockDim << (sizeCompressed & 0x3)).astype("int32")
+                blockHeight = (baseBlockDim << ((sizeCompressed >> 2) & 0x3)).astype("int32")
+
+                # Write frame header
+                (frameCode, frameLength) = biEncoder.getCode(sizeCompressed)
+                bitBuffer.write(frameLength, frameCode)
+
+                compressCursor += 1
+                compressCursor += huffmanCompressBlock(dcEncoder, acEncoder, bitBuffer, compressBuffer[compressCursor:], blockWidth * blockHeight)
+
+        frameCompressedSize = bitBuffer.size() - compressedSize
+        compressedSize += frameCompressedSize
+
+        print("Frame: {}, Full: {}, Squeezed: {}, Compressed: {}, Huffman Ratio: {}, Compression Ratio: {}".format(frameID, header.framePixels, uncompressedSize, frameCompressedSize, uncompressedSize / frameCompressedSize, header.framePixels / frameCompressedSize))
 
     bitstream = bitBuffer.toBuffer()
 
@@ -487,3 +628,51 @@ def entropyCompress(iBlocks, header):
     print("Full size: {}, Compressed: {}, Compression Ratio: {}".format(originalSize, encodedSize, originalSize / encodedSize))
 
     return bitstream
+
+
+
+
+def huffmanCompressBlock(dcEncoder, acEncoder, bitBuffer, compressBuffer, totalCoeffs):
+
+    
+    # Write DC coefficient
+    dcMagnitude = compressBuffer[0]
+    (magCode, magLength) = dcEncoder.getCode(dcMagnitude)
+    bitBuffer.write(magLength, magCode)
+
+    cursor = 1
+
+    if dcMagnitude != 0:
+
+        bitBuffer.write(dcMagnitude, readShort(compressBuffer[cursor:]))
+
+        cursor += 2
+
+
+    # Huffman-compress AC coefficients
+    acIndex = 1
+
+    while acIndex < totalCoeffs:
+
+        v = compressBuffer[cursor]
+
+        (code, length) = acEncoder.getCode(v)
+        bitBuffer.write(length, code)
+
+        cursor += 1
+
+        # Extended sequence
+        if v & 0x80:
+
+            (extCode, extLength) = acEncoder.getCode(compressBuffer[cursor])
+            bitBuffer.write(extLength, extCode)
+
+            cursor += 1
+
+        # EOB
+        elif v == 0x4F:
+            break
+
+        acIndex += (v & 0xF) + 1
+
+    return cursor

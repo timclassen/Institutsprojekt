@@ -13,7 +13,7 @@ class BitBuffer:
 
 
     def size(self):
-        return len(self.data)
+        return len(self.data) + (self.offset + 7) // 8
 
 
     def flush(self):

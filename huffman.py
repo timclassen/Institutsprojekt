@@ -97,6 +97,10 @@ class HuffmanEncoder:
 
     def serialize(self, bitBuffer: BitBuffer):
 
+        if len(self.symbolTable) == 0:
+            bitBuffer.write(8, 0)
+            return
+            
         highestLength = next(reversed(self.symbolTable.values()))[1]
         lengths = np.zeros(highestLength, dtype = np.uint8)
 

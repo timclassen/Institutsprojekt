@@ -38,3 +38,7 @@ def reverse(x, size):
         x >>= 1
 
     return y
+
+
+def pBlockSize(ctuSize, luma):
+    return ctuSize if luma else (ctuSize[0] >> 1, ctuSize[1] >> 1)

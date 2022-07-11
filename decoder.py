@@ -1,11 +1,13 @@
 # TODO: Put your implementation of the encoder here
 from distutils.ccompiler import gen_lib_options
+from email.mime import base
 import numpy as np
 from scipy.fftpack import idct
 from bitbuffer import BitReader
 from huffman import HuffmanDecoder
+from pblock import PBlock
 import quantization as quant
-from utils import DCPredictor
+from utils import DCPredictor, pBlockSize
 import zigzag as zz
 from header import Header
 
@@ -15,35 +17,39 @@ def decoder(bitstream):
 
     print("Decoding")
 
-    (header, blocks) = entropyDecompress(bitstream)
-    print("Decompressed")
-
-    quantizedBlocks = dequantization(blocks)
-    print("Dequantized data")
-
-    idctBlocks = applyIDCT(quantizedBlocks)
-    print("Applied IDCT")
-
-    result = reassembleFromBlocks(idctBlocks, header)
-    print("Reassembled image")
-
-    return result
-
-
-def reassembleFromBlocks(blocks, header):
+    (header, iBlocks, pBlocks) = entropyDecompress(bitstream)
 
     video = {
-        "Y": np.ndarray((header.frameCount, header.lumaSize[1], header.lumaSize[0]), dtype="uint8"),
-        "U": np.ndarray((header.frameCount, header.chromaSize[1], header.chromaSize[0]), dtype="uint8"),
-        "V": np.ndarray((header.frameCount, header.chromaSize[1], header.chromaSize[0]), dtype="uint8")
+        "Y": np.zeros((header.frameCount, header.lumaSize[1], header.lumaSize[0]), dtype="uint8"),
+        "U": np.zeros((header.frameCount, header.chromaSize[1], header.chromaSize[0]), dtype="uint8"),
+        "V": np.zeros((header.frameCount, header.chromaSize[1], header.chromaSize[0]), dtype="uint8")
     }
 
-    for component in video:
+    generateIFrames(video, iBlocks, header)
+    print("Generated I-Frames")
+
+    generatePFrames(video, pBlocks, header)
+    print("Generated P-Frames")
+
+    return video
+
+
+
+def generateIFrames(video, iBlocks, header):
+
+    dequantizeAndApplyIDCT(iBlocks)
+    return reassembleIntraBlocks(video, header, iBlocks)
+
+
+
+def reassembleIntraBlocks(video, header, iBlocks):
+
+    for component in iBlocks:
 
         luma = component == "Y"
         frameSize = header.lumaSize if luma else header.chromaSize
 
-        for block, blockData in blocks[component].items():
+        for block, blockData in iBlocks[component].items():
 
             frame = block[0]
             x = block[1]
@@ -51,31 +57,56 @@ def reassembleFromBlocks(blocks, header):
 
             video[component][frame, y:y+blockData.shape[0], x:x+blockData.shape[1]] = np.clip(np.round(blockData[:min(blockData.shape[0], frameSize[1] - y), :min(blockData.shape[1], frameSize[0] - x)]), 0, 255)
 
-    return video
 
 
-def applyIDCT(blocks):
-
-    for component in ["Y", "U", "V"]:
-
-        for block in blocks[component]:
-            blocks[component][block] = idct(idct(blocks[component][block], axis = 0, norm = 'ortho'), axis = 1, norm = 'ortho')
-
-    return blocks
-
-
-def dequantization(blocks):
-
-    quantization_matrices = {}
+def dequantizeAndApplyIDCT(blocks):
 
     for component in ["Y", "U", "V"]:
-        for key in blocks[component]:
-            blockSize = blocks[component][key].shape
-            if blockSize not in quantization_matrices:
-                quantization_matrices[blockSize] = quant.getQuantizationMatrix(blockSize, quant.DefaultQuantizationFunction)
-            blocks[component][key] *= quantization_matrices[blockSize]
- 
-    return blocks
+        for key, block in blocks[component].items():
+            blocks[component][key] = idct(idct(block * quant.getQuantizationMatrix(block.shape), axis = 0, norm = 'ortho'), axis = 1, norm = 'ortho')
+
+
+
+def generatePFrames(video, pBlocks, header):
+
+    for component, frames in pBlocks.items():
+
+        luma = component == "Y"
+        blockSize = pBlockSize(header.ctuSize, luma)
+        frameSize = header.lumaSize if luma else header.chromaSize
+
+        for frameID in range(header.frameCount):
+
+            if (frameID & (header.gopSize - 1)) == 0:
+                continue
+
+            refFrameID = frameID // header.gopSize * header.gopSize
+
+            for pBlock in frames[frameID]:
+
+                pos = pBlock.position
+                block = pBlock.block
+
+                if pBlock.type <= 1:
+                    refPos = pos - pBlock.motionVector
+
+                if (pBlock.type & 1) == 0:
+
+                    block = idct(idct(block * quant.getQuantizationMatrix(block.shape), axis = 0, norm = 'ortho'), axis = 1, norm = 'ortho')
+
+                    if pBlock.type == 0:
+                        block += video[component][refFrameID, refPos[1] : refPos[1] + blockSize[1], refPos[0] : refPos[0] + blockSize[0]]
+
+                    video[component][frameID, pos[1] : pos[1] + blockSize[1], pos[0] : pos[0] + blockSize[0]] = np.clip(np.round(block), 0, 255)
+
+                else:
+
+                    if pBlock.type == 1:
+                        video[component][frameID, pos[1] : pos[1] + blockSize[1], pos[0] : pos[0] + blockSize[0]] = video[component][refFrameID, refPos[1] : refPos[1] + blockSize[1], refPos[0] : refPos[0] + blockSize[0]]
+                    else:
+                        video[component][frameID, pos[1] : pos[1] + blockSize[1], pos[0] : pos[0] + blockSize[0]] = video[component][refFrameID, pos[1] : pos[1] + blockSize[1], pos[0] : pos[0] + blockSize[0]]
+
+
 
 
 def inplaceDecompress(block, bitReader, dcPred, dcDecoder, acDecoder, dezigzag):
@@ -140,14 +171,16 @@ def readStreamHeader(bitReader: BitReader):
     if s != ord('S') or v != ord('V') or c != ord('C') or version != 0:
         raise RuntimeError("Bad SVC file")
 
-    gopSize = bitReader.read(8)
     lumaSizeW = bitReader.read(32)
     lumaSizeH = bitReader.read(32)
     chromaSizeW = bitReader.read(32)
     chromaSizeH = bitReader.read(32)
     frameCount = bitReader.read(32)
+    ctuSizeX = bitReader.read(8)
+    ctuSizeY = bitReader.read(8)
+    gopSize = bitReader.read(8)
 
-    header = Header((lumaSizeW, lumaSizeH), (chromaSizeW, chromaSizeH), frameCount, gopSize)
+    header = Header((lumaSizeW, lumaSizeH), (chromaSizeW, chromaSizeH), frameCount, (ctuSizeX, ctuSizeY), gopSize)
 
     return header
 
@@ -158,8 +191,8 @@ def entropyDecompress(bitstream):
     bitReader = BitReader(bitstream)
     header = readStreamHeader(bitReader)
 
-    blocks = { "Y": {}, "U": {}, "V": {}}
-    dezigzagTransforms = {}
+    iBlocks = { "Y": {}, "U": {}, "V": {}}
+    pBlocks = { "Y": {}, "U": {}, "V": {}}
 
     # For simplicity reasons, we assume blocks are in descending order towards the border
     blockLumaEndX = ((header.lumaSize[0] + 7) // 8) * 8
@@ -169,15 +202,15 @@ def entropyDecompress(bitstream):
     
     for frameID in range(header.frameCount):
 
-        if frameID & (header.gopSize - 1):
-            continue
+        interFrame = frameID & (header.gopSize - 1)
 
-        biDecoder = HuffmanDecoder()
+        bmDecoder = HuffmanDecoder()
         dcDecoder = HuffmanDecoder()
         acDecoder = HuffmanDecoder()
 
         bitReader.align()
-        biDecoder.deserialize(bitReader)
+
+        bmDecoder.deserialize(bitReader)
         dcDecoder.deserialize(bitReader)
         acDecoder.deserialize(bitReader)
 
@@ -185,8 +218,10 @@ def entropyDecompress(bitstream):
 
             luma = component == "Y"
             baseBlockDim = 8 if luma else 4
+            blockSize = pBlockSize(header.ctuSize, luma)
 
             dcPrediction = DCPredictor()
+            pBlocks[component][frameID] = []
 
             blockEndX = blockLumaEndX if luma else blockChromaEndX
             blockEndY = blockLumaEndY if luma else blockChromaEndY
@@ -194,31 +229,61 @@ def entropyDecompress(bitstream):
 
             while True:
 
-                # Read block information
-                sizeCompressed = biDecoder.read(bitReader)
+                if interFrame:
 
-                blockWidth = (baseBlockDim << (sizeCompressed & 0x3)).astype("int32")
-                blockHeight = (baseBlockDim << ((sizeCompressed >> 2) & 0x3)).astype("int32")
-                newFrame = sizeCompressed & 0x80
+                    blockWidth = blockSize[0]
+                    blockHeight = blockSize[1]
 
-                # Setup block information
-                blockKey = (frameID, blockPosition[0], blockPosition[1])
-                blockSize = (blockWidth, blockHeight)
+                    type = bitReader.read(2)
+                    pBlock = PBlock(blockPosition, type)
 
-                totalPixels = blockWidth * blockHeight
+                    if type <= 1:
 
-                # Create dezigzag transform
-                if blockSize not in dezigzagTransforms:
-                    dezigzagTransforms[blockSize] = zz.zigzagTransform(blockSize)
+                        motionVector = np.zeros(2, dtype = np.int32)
 
-                # Create block buffer
-                block = np.zeros(totalPixels, dtype = np.float64)
+                        for i in range(2):
 
-                # Decompress
-                inplaceDecompress(block, bitReader, dcPrediction, dcDecoder, acDecoder, dezigzagTransforms[blockSize])
+                            positive = bitReader.read(1)
+                            magnitude = bmDecoder.read(bitReader).astype("int32")
 
-                # Add block to tree
-                blocks[component][blockKey] = np.reshape(block, (blockHeight, blockWidth))
+                            if not positive:
+                                magnitude = -magnitude
+
+                            motionVector[i] = magnitude
+
+                        pBlock.motionVector = motionVector
+
+                    if(type & 1) == 0:
+
+                        block = np.zeros(blockWidth * blockHeight, dtype = np.float64)
+                        inplaceDecompress(block, bitReader, dcPrediction, dcDecoder, acDecoder, zz.zigzag((blockWidth, blockHeight)))
+
+                        pBlock.block = np.reshape(block, (blockHeight, blockWidth))
+
+                    pBlocks[component][frameID].append(pBlock)
+
+                else:
+
+                    # Read block information
+                    sizeCompressed = bmDecoder.read(bitReader)
+
+                    blockWidth = (baseBlockDim << (sizeCompressed & 0x3)).astype("int32")
+                    blockHeight = (baseBlockDim << ((sizeCompressed >> 2) & 0x3)).astype("int32")
+
+                    # Setup block information
+                    blockKey = (frameID, blockPosition[0], blockPosition[1])
+                    blockSize = (blockWidth, blockHeight)
+
+                    totalPixels = blockWidth * blockHeight
+
+                    # Create block buffer
+                    block = np.zeros(totalPixels, dtype = np.float64)
+
+                    # Decompress
+                    inplaceDecompress(block, bitReader, dcPrediction, dcDecoder, acDecoder, zz.zigzag(blockSize))
+
+                    # Add block to tree
+                    iBlocks[component][blockKey] = np.reshape(block, (blockHeight, blockWidth))
 
                 # Set new block position
                 blockPosition = (blockPosition[0] + blockWidth, blockPosition[1])
@@ -232,4 +297,4 @@ def entropyDecompress(bitstream):
 
         print("Decoded frame {}".format(frameID))
 
-    return (header, blocks)
+    return (header, iBlocks, pBlocks)

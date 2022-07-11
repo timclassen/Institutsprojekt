@@ -14,6 +14,8 @@ baseQuantizationMatrix = np.array([
 ], dtype = np.float64)
 
 
+QuantizationMatrixCache = {}
+
 
 def quantizationVectorLength(x, y):
     return np.round(max(np.sqrt(x**2 + y**2), 1))
@@ -27,18 +29,23 @@ def quantizationNone(x, y):
 def quantizationDCOnly(x, y):
     return 1 if x == 0 and y == 0 else 511
 
-def getQuantizationMatrix(blockSize, quantFunc):
+def getQuantizationMatrix(blockSize):
 
-    if quantFunc == quantizationScaled:
-        return cv.resize(baseQuantizationMatrix, dsize = (blockSize[1], blockSize[0]), interpolation = cv.INTER_LINEAR_EXACT)
+    if blockSize not in QuantizationMatrixCache:
 
-    quantizationMatrix = np.empty(blockSize, dtype = np.float64)
+        quantizationMatrix = np.empty(blockSize, dtype = np.float64)
 
-    for y in range(blockSize[1]):
-        for x in range(blockSize[0]):
-            quantizationMatrix[x, y] = quantFunc(x, y)
+        if DefaultQuantizationFunction == quantizationScaled:
+            quantizationMatrix = cv.resize(baseQuantizationMatrix, dsize = (blockSize[1], blockSize[0]), interpolation = cv.INTER_LINEAR_EXACT)
+        else:
 
-    return quantizationMatrix
+            for y in range(blockSize[1]):
+                for x in range(blockSize[0]):
+                    quantizationMatrix[x, y] = quantizationMatrix(x, y)
+        
+        QuantizationMatrixCache[blockSize] = quantizationMatrix
+
+    return QuantizationMatrixCache[blockSize]
 
 
 DefaultQuantizationFunction = quantizationScaled

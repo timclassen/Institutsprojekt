@@ -15,6 +15,8 @@ def sliceVideo(video, start, frames):
         "V": video["V"][start:start + frames]
     }
 
+    return video
+
 
 def encode_and_decode_video(yuvVideoPath):
 
@@ -23,15 +25,15 @@ def encode_and_decode_video(yuvVideoPath):
     
     originalVideo = read_yuv_video(yuvVideoPath, bit_depth = 8)
 
-    # sliceVideo(originalVideo, 0, 2)
-
-    bitstream = encoder(originalVideo, (64, 64))
+    #originalVideo = sliceVideo(originalVideo, 0, 16)
+    #'''
+    bitstream = encoder(originalVideo)
     bitstreamSize = bitstream.size
     print("Encoded")
 
     writeBitstream(svcPath, bitstream)
     print("Written to file " + svcPath)
-    
+    #'''
     bitstream = readBitstream(svcPath)
     decodedVideo = decoder(bitstream)
     print("Decoded")

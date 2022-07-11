@@ -54,3 +54,14 @@ def dezigzagTransform(blockSize):
             cury += 1
 
     return transformArray
+
+
+ZigzagTransformCache = {}
+
+
+def zigzag(blockSize):
+
+    if blockSize not in ZigzagTransformCache:
+        ZigzagTransformCache[blockSize] = zigzagTransform(blockSize)
+
+    return ZigzagTransformCache[blockSize]
