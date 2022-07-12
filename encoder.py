@@ -21,7 +21,7 @@ def encoder(video):
 
     print("Encoding")
 
-    header = Header((video["Y"].shape[2], video["Y"].shape[1]), (video["U"].shape[2], video["U"].shape[1]), video["Y"].shape[0], (32, 32), 4, 4, 4)
+    header = Header((video["Y"].shape[2], video["Y"].shape[1]), (video["U"].shape[2], video["U"].shape[1]), video["Y"].shape[0], (16, 16), 8, 127, 0.90)
 
     (iFrames, pFrames) = splitFrames(video, header.gopSize)
     pBlocks = generatePBlocks(iFrames, pFrames, header)
@@ -75,7 +75,7 @@ def generatePBlocks(iFrames, pFrames, header):
         blockSize = pBlockSize(header.ctuSize, luma)
         frameSize = header.lumaSize if luma else header.chromaSize
 
-        motionDistance = (header.pMotionMaxBlockOffset * blockSize[0], header.pMotionMaxBlockOffset * blockSize[1])
+        motionDistance = (header.pMotionMaxBlockOffset, header.pMotionMaxBlockOffset)
 
         for i in range(len(frames)):
             
@@ -101,7 +101,7 @@ def generatePBlocks(iFrames, pFrames, header):
 
                     else:
 
-                        (found, motion, diffBlock) = findMotionBlock(block, (x, y), refIFrame[regionBase[1] : min(y + motionDistance[1], frameSize[1]), regionBase[0] : min(x + motionDistance[0], frameSize[0])].astype("float32"), regionBase)
+                        (found, motion, diffBlock) = findMotionBlock(block, (x, y), refIFrame[regionBase[1] : min(y + motionDistance[1], frameSize[1]), regionBase[0] : min(x + motionDistance[0], frameSize[0])].astype("float32"), regionBase, header.pPatternThreshold)
 
                         if found:
 
@@ -138,12 +138,12 @@ def checkPerfectMatch(pBlock, refRegion):
 
 
 
-def findMotionBlock(pBlock, pBlockPos, refRegion, refRegionPos):
+def findMotionBlock(pBlock, pBlockPos, refRegion, refRegionPos, threshold):
     
     result = cv.matchTemplate(refRegion, pBlock, cv.TM_CCOEFF_NORMED)
     minValue, maxValue, minPos, maxPos = cv.minMaxLoc(result)
 
-    if maxValue >= 0.9:
+    if maxValue >= threshold:
         
         motionVector = (pBlockPos[0] - (refRegionPos[0] + maxPos[0]), pBlockPos[1] - (refRegionPos[1] + maxPos[1]))
         refBlock = refRegion[maxPos[1] : maxPos[1] + pBlock.shape[0], maxPos[0] : maxPos[0] + pBlock.shape[1]]
@@ -245,7 +245,7 @@ def inplaceCompress(block, stream, dcPred, dcEncoder, acEncoder):
         ESXXZZZZ [XXXXXXXX]
         E: Extended sequence
         S: Sign bit
-        X: Difference in 2s complement
+        X: Value
         Z: Zero run length
         EOB is encoded as 01001111 == 0x4F
     '''
@@ -368,6 +368,9 @@ def writeStreamHeader(header, bitBuffer: BitBuffer):
         u32: Chroma Width
         u32: Chroma Height
         u32: Frame Count
+        u8: CTU Width
+        u8: CTU Height
+        u8: GoP Size
     '''
     bitBuffer.write(8, ord('S'))
     bitBuffer.write(8, ord('V'))
@@ -434,16 +437,12 @@ def entropyCompress(iBlocks, pBlocks, header):
             dcEncoder = HuffmanEncoder()
             acEncoder = HuffmanEncoder()
 
-            prevBlockPos = np.zeros(2)
-
             for component in ["Y", "U", "V"]:
 
                 dcPrediction = DCPredictor()
                 pFrameArray = pBlocks[component][frameID]
 
                 for pBlock in pFrameArray:
-
-                    blockPos = np.array(pBlock.position)
 
                     type = pBlock.type
 

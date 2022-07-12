@@ -1,7 +1,7 @@
 #The video's metadata
 class Header:
 
-    def __init__(self, lumaSize, chromaSize, frames, ctuSize, gopSize, pFrameMaxBacktrack = 4, pMotionMaxBlockOffset = 16):
+    def __init__(self, lumaSize, chromaSize, frames, ctuSize, gopSize, pMotionMaxBlockOffset = 127, pPatternThreshold = 0.9):
         self.lumaSize = lumaSize
         self.chromaSize = chromaSize
         self.frameCount = frames
@@ -11,5 +11,5 @@ class Header:
         self.totalPixels = self.framePixels * self.frameCount
         self.ctuSize = ctuSize
         self.gopSize = gopSize
-        self.pFrameMaxBacktrack = pFrameMaxBacktrack
-        self.pMotionMaxBlockOffset = pMotionMaxBlockOffset
+        self.pMotionMaxBlockOffset = min(pMotionMaxBlockOffset, 127)
+        self.pPatternThreshold = pPatternThreshold
